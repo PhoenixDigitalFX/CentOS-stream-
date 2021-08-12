@@ -190,6 +190,14 @@ struct net {
 	RH_KABI_EXTEND(int	sctp_pf_expose)
 	RH_KABI_EXTEND(int	sctp_ps_retrans)
 	RH_KABI_EXTEND_WITH_SIZE(struct netns_bpf bpf, 128)
+	/* UDP tunneling listening sock. */
+	RH_KABI_EXTEND(struct sock	*sctp_udp4_sock)
+	RH_KABI_EXTEND(struct sock	*sctp_udp6_sock)
+	/* UDP tunneling listening port. */
+	RH_KABI_EXTEND(int	sctp_udp_port)
+	/* UDP tunneling remote encap port. */
+	RH_KABI_EXTEND(int	sctp_encap_port)
+	RH_KABI_EXTEND(seqcount_spinlock_t	xfrm_state_hash_generation)
 } __randomize_layout;
 
 #include <linux/seq_file_net.h>
@@ -222,7 +230,7 @@ extern struct list_head net_namespace_list;
 struct net *get_net_ns_by_pid(pid_t pid);
 struct net *get_net_ns_by_fd(int fd);
 
-u64 net_gen_cookie(struct net *net);
+u64 __net_gen_cookie(struct net *net);
 
 #ifdef CONFIG_SYSCTL
 void ipx_register_sysctl(void);

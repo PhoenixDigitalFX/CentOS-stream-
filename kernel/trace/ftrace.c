@@ -193,17 +193,6 @@ static void ftrace_pid_func(unsigned long ip, unsigned long parent_ip,
 	op->saved_func(ip, parent_ip, op, regs);
 }
 
-static void ftrace_sync(struct work_struct *work)
-{
-	/*
-	 * This function is just a stub to implement a hard force
-	 * of synchronize_rcu(). This requires synchronizing
-	 * tasks even in userspace and idle.
-	 *
-	 * Yes, function tracing is rude.
-	 */
-}
-
 static void ftrace_sync_ipi(void *data)
 {
 	/* Probably not needed, but do it anyway */
@@ -301,7 +290,7 @@ static void update_ftrace_function(void)
 	 * Make sure all CPUs see this. Yes this is slow, but static
 	 * tracing is slow and nasty to have enabled.
 	 */
-	schedule_on_each_cpu(ftrace_sync);
+	synchronize_rcu_tasks_rude();
 	/* Now all cpus are using the list ops. */
 	function_trace_op = set_function_trace_op;
 	/* Make sure the function_trace_op is visible on all CPUs */
@@ -2977,7 +2966,7 @@ static int ftrace_shutdown(struct ftrace_ops *ops, int command)
 		 * infrastructure to do the synchronization, thus we must do it
 		 * ourselves.
 		 */
-		schedule_on_each_cpu(ftrace_sync);
+		synchronize_rcu_tasks_rude();
 
 		/*
 		 * When the kernel is preeptive, tasks can be preempted
@@ -5529,8 +5518,8 @@ static const struct file_operations ftrace_notrace_fops = {
 
 static DEFINE_MUTEX(graph_lock);
 
-struct ftrace_hash *ftrace_graph_hash = EMPTY_HASH;
-struct ftrace_hash *ftrace_graph_notrace_hash = EMPTY_HASH;
+struct ftrace_hash __rcu *ftrace_graph_hash = EMPTY_HASH;
+struct ftrace_hash __rcu *ftrace_graph_notrace_hash = EMPTY_HASH;
 
 enum graph_filter_type {
 	GRAPH_FILTER_NOTRACE	= 0,
@@ -5801,8 +5790,15 @@ ftrace_graph_release(struct inode *inode, struct file *file)
 
 		mutex_unlock(&graph_lock);
 
-		/* Wait till all users are no longer using the old hash */
-		synchronize_rcu();
+		/*
+		 * We need to do a hard force of sched synchronization.
+		 * This is because we use preempt_disable() to do RCU, but
+		 * the function tracers can be called where RCU is not watching
+		 * (like before user_exit()). We can not rely on the RCU
+		 * infrastructure to do the synchronization, thus we must do it
+		 * ourselves.
+		 */
+		synchronize_rcu_tasks_rude();
 
 		free_ftrace_hash(old_hash);
 	}

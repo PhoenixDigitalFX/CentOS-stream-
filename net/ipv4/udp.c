@@ -667,7 +667,7 @@ static struct sock *__udp4_lib_err_encap(struct net *net,
  * to find the appropriate port.
  */
 
-void __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
+int __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
 {
 	struct inet_sock *inet;
 	const struct iphdr *iph = (const struct iphdr *)skb->data;
@@ -681,16 +681,16 @@ void __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
 	struct net *net = dev_net(skb->dev);
 
 	sk = __udp4_lib_lookup(net, iph->daddr, uh->dest,
-			       iph->saddr, uh->source, skb->dev->ifindex, 0,
-			       udptable, NULL);
-	if (!sk) {
+			       iph->saddr, uh->source, skb->dev->ifindex,
+			       inet_sdif(skb), udptable, NULL);
+	if (!sk || udp_sk(sk)->encap_type) {
 		/* No socket for error: try tunnels before discarding */
 		if (static_branch_unlikely(&udp_encap_needed_key))
 			sk = __udp4_lib_err_encap(net, iph, uh, udptable, skb);
 
 		if (!sk) {
 			__ICMP_INC_STATS(net, ICMP_MIB_INERRORS);
-			return;
+			return -ENOENT;
 		}
 		tunnel = true;
 	}
@@ -748,12 +748,12 @@ void __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
 	sk->sk_err = err;
 	sk->sk_error_report(sk);
 out:
-	return;
+	return 0;
 }
 
-void udp_err(struct sk_buff *skb, u32 info)
+int udp_err(struct sk_buff *skb, u32 info)
 {
-	__udp4_lib_err(skb, info, &udp_table);
+	return __udp4_lib_err(skb, info, &udp_table);
 }
 
 /*
@@ -2138,6 +2138,8 @@ static int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	for (skb = segs; skb; skb = next) {
 		next = skb->next;
 		__skb_pull(skb, skb_transport_offset(skb));
+
+		udp_post_segment_fix_csum(skb);
 		ret = udp_queue_rcv_one_skb(sk, skb);
 		if (ret > 0)
 			ip_protocol_deliver_rcu(dev_net(skb->dev), skb, ret);
@@ -2521,7 +2523,8 @@ int udp_v4_early_demux(struct sk_buff *skb)
 		 */
 		if (!inet_sk(sk)->inet_daddr && in_dev)
 			return ip_mc_validate_source(skb, iph->daddr,
-						     iph->saddr, iph->tos,
+						     iph->saddr,
+						     iph->tos & IPTOS_RT_MASK,
 						     skb->dev, in_dev, &itag);
 	}
 	return 0;
@@ -2624,9 +2627,12 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 
 	case UDP_GRO:
 		lock_sock(sk);
+
+		/* when enabling GRO, accept the related GSO packet type */
 		if (valbool)
 			udp_tunnel_encap_enable(sk->sk_socket);
 		up->gro_enabled = valbool;
+		up->accept_udp_l4 = valbool;
 		release_sock(sk);
 		break;
 
@@ -2722,6 +2728,10 @@ int udp_lib_getsockopt(struct sock *sk, int level, int optname,
 
 	case UDP_SEGMENT:
 		val = up->gso_size;
+		break;
+
+	case UDP_GRO:
+		val = up->gro_enabled;
 		break;
 
 	/* The following two cannot be changed on UDP sockets, the return is

@@ -39,44 +39,23 @@ static inline bool xfs_ioend_is_append(struct iomap_ioend *ioend)
 		XFS_I(ioend->io_inode)->i_d.di_size;
 }
 
-STATIC int
-xfs_setfilesize_trans_alloc(
-	struct iomap_ioend	*ioend)
+/*
+ * Update on-disk file size now that data has been written to disk.
+ */
+int
+xfs_setfilesize(
+	struct xfs_inode	*ip,
+	xfs_off_t		offset,
+	size_t			size)
 {
-	struct xfs_mount	*mp = XFS_I(ioend->io_inode)->i_mount;
+	struct xfs_mount	*mp = ip->i_mount;
 	struct xfs_trans	*tp;
+	xfs_fsize_t		isize;
 	int			error;
 
 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_fsyncts, 0, 0, 0, &tp);
 	if (error)
 		return error;
-
-	ioend->io_private = tp;
-
-	/*
-	 * We may pass freeze protection with a transaction.  So tell lockdep
-	 * we released it.
-	 */
-	__sb_writers_release(ioend->io_inode->i_sb, SB_FREEZE_FS);
-	/*
-	 * We hand off the transaction to the completion thread now, so
-	 * clear the flag here.
-	 */
-	current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
-	return 0;
-}
-
-/*
- * Update on-disk file size now that data has been written to disk.
- */
-STATIC int
-__xfs_setfilesize(
-	struct xfs_inode	*ip,
-	struct xfs_trans	*tp,
-	xfs_off_t		offset,
-	size_t			size)
-{
-	xfs_fsize_t		isize;
 
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 	isize = xfs_new_eof(ip, offset + size);
@@ -93,48 +72,6 @@ __xfs_setfilesize(
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
 	return xfs_trans_commit(tp);
-}
-
-int
-xfs_setfilesize(
-	struct xfs_inode	*ip,
-	xfs_off_t		offset,
-	size_t			size)
-{
-	struct xfs_mount	*mp = ip->i_mount;
-	struct xfs_trans	*tp;
-	int			error;
-
-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_fsyncts, 0, 0, 0, &tp);
-	if (error)
-		return error;
-
-	return __xfs_setfilesize(ip, tp, offset, size);
-}
-
-STATIC int
-xfs_setfilesize_ioend(
-	struct iomap_ioend	*ioend,
-	int			error)
-{
-	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
-	struct xfs_trans	*tp = ioend->io_private;
-
-	/*
-	 * The transaction may have been allocated in the I/O submission thread,
-	 * thus we need to mark ourselves as being in a transaction manually.
-	 * Similarly for freeze protection.
-	 */
-	current_set_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
-	__sb_writers_acquired(VFS_I(ip)->i_sb, SB_FREEZE_FS);
-
-	/* we abort the update if there was an IO error */
-	if (error) {
-		xfs_trans_cancel(tp);
-		return error;
-	}
-
-	return __xfs_setfilesize(ip, tp, ioend->io_offset, ioend->io_size);
 }
 
 /*
@@ -158,7 +95,7 @@ xfs_end_ioend(
 	nofs_flag = memalloc_nofs_save();
 
 	/*
-	 * Just clean up the in-memory strutures if the fs has been shut down.
+	 * Just clean up the in-memory structures if the fs has been shut down.
 	 */
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
 		error = -EIO;
@@ -182,33 +119,12 @@ xfs_end_ioend(
 		error = xfs_reflink_end_cow(ip, offset, size);
 	else if (ioend->io_type == IOMAP_UNWRITTEN)
 		error = xfs_iomap_write_unwritten(ip, offset, size, false);
-	else
-		ASSERT(!xfs_ioend_is_append(ioend) || ioend->io_private);
 
+	if (!error && xfs_ioend_is_append(ioend))
+		error = xfs_setfilesize(ip, ioend->io_offset, ioend->io_size);
 done:
-	if (ioend->io_private)
-		error = xfs_setfilesize_ioend(ioend, error);
 	iomap_finish_ioends(ioend, error);
 	memalloc_nofs_restore(nofs_flag);
-}
-
-/*
- * If the to be merged ioend has a preallocated transaction for file
- * size updates we need to ensure the ioend it is merged into also
- * has one.  If it already has one we can simply cancel the transaction
- * as it is guaranteed to be clean.
- */
-static void
-xfs_ioend_merge_private(
-	struct iomap_ioend	*ioend,
-	struct iomap_ioend	*next)
-{
-	if (!ioend->io_private) {
-		ioend->io_private = next->io_private;
-		next->io_private = NULL;
-	} else {
-		xfs_setfilesize_ioend(next, -ECANCELED);
-	}
 }
 
 /* Finish all pending io completions. */
@@ -230,16 +146,9 @@ xfs_end_io(
 	while ((ioend = list_first_entry_or_null(&tmp, struct iomap_ioend,
 			io_list))) {
 		list_del_init(&ioend->io_list);
-		iomap_ioend_try_merge(ioend, &tmp, xfs_ioend_merge_private);
+		iomap_ioend_try_merge(ioend, &tmp, NULL);
 		xfs_end_ioend(ioend);
 	}
-}
-
-static inline bool xfs_ioend_needs_workqueue(struct iomap_ioend *ioend)
-{
-	return ioend->io_private ||
-		ioend->io_type == IOMAP_UNWRITTEN ||
-		(ioend->io_flags & IOMAP_F_SHARED);
 }
 
 STATIC void
@@ -249,8 +158,6 @@ xfs_end_bio(
 	struct iomap_ioend	*ioend = bio->bi_private;
 	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
 	unsigned long		flags;
-
-	ASSERT(xfs_ioend_needs_workqueue(ioend));
 
 	spin_lock_irqsave(&ip->i_ioend_lock, flags);
 	if (list_empty(&ip->i_ioend_list))
@@ -346,8 +253,8 @@ xfs_map_blocks(
 	ssize_t			count = i_blocksize(inode);
 	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
 	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, offset + count);
-	xfs_fileoff_t		cow_fsb = NULLFILEOFF;
-	int			whichfork = XFS_DATA_FORK;
+	xfs_fileoff_t		cow_fsb;
+	int			whichfork;
 	struct xfs_bmbt_irec	imap;
 	struct xfs_iext_cursor	icur;
 	int			retries = 0;
@@ -381,8 +288,10 @@ xfs_map_blocks(
 	 * landed in a hole and we skip the block.
 	 */
 retry:
+	cow_fsb = NULLFILEOFF;
+	whichfork = XFS_DATA_FORK;
 	xfs_ilock(ip, XFS_ILOCK_SHARED);
-	ASSERT(ip->i_d.di_format != XFS_DINODE_FMT_BTREE ||
+	ASSERT(ip->i_df.if_format != XFS_DINODE_FMT_BTREE ||
 	       (ip->i_df.if_flags & XFS_IFEXTENTS));
 
 	/*
@@ -499,17 +408,11 @@ xfs_prepare_ioend(
 				ioend->io_offset, ioend->io_size);
 	}
 
-	/* Reserve log space if we might write beyond the on-disk inode size. */
-	if (!status &&
-	    ((ioend->io_flags & IOMAP_F_SHARED) ||
-	     ioend->io_type != IOMAP_UNWRITTEN) &&
-	    xfs_ioend_is_append(ioend) &&
-	    !ioend->io_private)
-		status = xfs_setfilesize_trans_alloc(ioend);
-
 	memalloc_nofs_restore(nofs_flag);
 
-	if (xfs_ioend_needs_workqueue(ioend))
+	/* send ioends that might require a transaction to the completion wq */
+	if (xfs_ioend_is_append(ioend) || ioend->io_type == IOMAP_UNWRITTEN ||
+	    (ioend->io_flags & IOMAP_F_SHARED))
 		ioend->io_bio->bi_end_io = xfs_end_bio;
 	return status;
 }
@@ -539,7 +442,7 @@ xfs_discard_page(
 	if (XFS_FORCED_SHUTDOWN(mp))
 		goto out_invalidate;
 
-	xfs_alert(mp,
+	xfs_alert_ratelimited(mp,
 		"page discard on page "PTR_FMT", inode 0x%llx, offset %llu.",
 			page, ip->i_ino, offset);
 

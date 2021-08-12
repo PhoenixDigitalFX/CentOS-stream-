@@ -877,11 +877,11 @@ static inline int mpx_disable_management(void)
 #endif /* CONFIG_X86_INTEL_MPX */
 
 #ifdef CONFIG_CPU_SUP_AMD
-extern u16 amd_get_nb_id(int cpu);
 extern u32 amd_get_nodes_per_socket(void);
+extern u32 amd_get_highest_perf(void);
 #else
-static inline u16 amd_get_nb_id(int cpu)		{ return 0; }
 static inline u32 amd_get_nodes_per_socket(void)	{ return 0; }
+static inline u32 amd_get_highest_perf(void)		{ return 0; }
 #endif
 
 static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
@@ -928,13 +928,6 @@ enum mds_mitigations {
 	MDS_MITIGATION_OFF,
 	MDS_MITIGATION_FULL,
 	MDS_MITIGATION_VMWERV,
-};
-
-enum taa_mitigations {
-	TAA_MITIGATION_OFF,
-	TAA_MITIGATION_UCODE_NEEDED,
-	TAA_MITIGATION_VERW,
-	TAA_MITIGATION_TSX_DISABLED,
 };
 
 #endif /* _ASM_X86_PROCESSOR_H */

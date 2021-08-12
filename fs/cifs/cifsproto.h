@@ -209,6 +209,8 @@ extern int cifs_set_file_info(struct inode *inode, struct iattr *attrs,
 extern int cifs_rename_pending_delete(const char *full_path,
 				      struct dentry *dentry,
 				      const unsigned int xid);
+extern int sid_to_id(struct cifs_sb_info *cifs_sb, struct cifs_sid *psid,
+				struct cifs_fattr *fattr, uint sidtype);
 extern int cifs_acl_to_fattr(struct cifs_sb_info *cifs_sb,
 			      struct cifs_fattr *fattr, struct inode *inode,
 			      bool get_mode_from_special_sid,
@@ -271,6 +273,9 @@ void cifs_proc_clean(void);
 extern void cifs_move_llist(struct list_head *source, struct list_head *dest);
 extern void cifs_free_llist(struct list_head *llist);
 extern void cifs_del_lock_waiters(struct cifsLockInfo *lock);
+
+extern int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon,
+			     const struct nls_table *nlsc);
 
 extern int cifs_negotiate_protocol(const unsigned int xid,
 				   struct cifs_ses *ses);
@@ -614,8 +619,7 @@ int smb2_parse_query_directory(struct cifs_tcon *tcon, struct kvec *rsp_iov,
 
 struct super_block *cifs_get_tcp_super(struct TCP_Server_Info *server);
 void cifs_put_tcp_super(struct super_block *sb);
-int update_super_prepath(struct cifs_tcon *tcon, const char *prefix,
-			 size_t prefix_len);
+int update_super_prepath(struct cifs_tcon *tcon, char *prefix);
 
 #ifdef CONFIG_CIFS_DFS_UPCALL
 static inline int get_dfs_path(const unsigned int xid, struct cifs_ses *ses,

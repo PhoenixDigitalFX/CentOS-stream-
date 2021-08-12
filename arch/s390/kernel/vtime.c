@@ -216,7 +216,7 @@ void vtime_flush(struct task_struct *tsk)
 	avg_steal = S390_lowcore.avg_steal_timer / 2;
 	if ((s64) steal > 0) {
 		S390_lowcore.steal_timer = 0;
-		account_steal_time(steal);
+		account_steal_time(cputime_to_nsecs(steal));
 		avg_steal += steal;
 	}
 	S390_lowcore.avg_steal_timer = avg_steal;
@@ -247,9 +247,9 @@ void vtime_account_irq_enter(struct task_struct *tsk)
 }
 EXPORT_SYMBOL_GPL(vtime_account_irq_enter);
 
-void vtime_account_system(struct task_struct *tsk)
+void vtime_account_kernel(struct task_struct *tsk)
 __attribute__((alias("vtime_account_irq_enter")));
-EXPORT_SYMBOL_GPL(vtime_account_system);
+EXPORT_SYMBOL_GPL(vtime_account_kernel);
 
 /*
  * Sorted add to a list. List is linear searched until first bigger

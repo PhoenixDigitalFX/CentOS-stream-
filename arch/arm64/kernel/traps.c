@@ -397,12 +397,12 @@ void arm64_notify_segfault(unsigned long addr)
 {
 	int code;
 
-	down_read(&current->mm->mmap_sem);
+	mmap_read_lock(current->mm);
 	if (find_vma(current->mm, addr) == NULL)
 		code = SEGV_MAPERR;
 	else
 		code = SEGV_ACCERR;
-	up_read(&current->mm->mmap_sem);
+	mmap_read_unlock(current->mm);
 
 	force_signal_inject(SIGSEGV, code, addr);
 }
@@ -727,17 +727,13 @@ bool arm64_is_fatal_ras_serror(struct pt_regs *regs, unsigned int esr)
 
 asmlinkage void do_serror(struct pt_regs *regs, unsigned int esr)
 {
-	const bool was_in_nmi = in_nmi();
-
-	if (!was_in_nmi)
-		nmi_enter();
+	nmi_enter();
 
 	/* non-RAS errors are not containable */
 	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
 		arm64_serror_panic(regs, esr);
 
-	if (!was_in_nmi)
-		nmi_exit();
+	nmi_exit();
 }
 
 void __pte_error(const char *file, int line, unsigned long val)

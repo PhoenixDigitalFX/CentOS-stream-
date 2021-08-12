@@ -293,6 +293,7 @@ struct nf_bridge_info {
 struct tc_skb_ext {
 	__u32 chain;
 	__u16 mru;
+	bool post_ct;
 };
 #endif
 
@@ -2570,6 +2571,11 @@ static inline int skb_mac_header_was_set(const struct sk_buff *skb)
 	return skb->mac_header != (typeof(skb->mac_header))~0U;
 }
 
+static inline void skb_unset_mac_header(struct sk_buff *skb)
+{
+	skb->mac_header = (typeof(skb->mac_header))~0U;
+}
+
 static inline void skb_reset_mac_header(struct sk_buff *skb)
 {
 	skb->mac_header = skb->data - skb->head;
@@ -2942,12 +2948,28 @@ static inline struct page *dev_alloc_page(void)
 }
 
 /**
+ * dev_page_is_reusable - check whether a page can be reused for network Rx
+ * @page: the page to test
+ *
+ * A page shouldn't be considered for reusing/recycling if it was allocated
+ * under memory pressure or at a distant memory node.
+ *
+ * Returns false if this page should be returned to page allocator, true
+ * otherwise.
+ */
+static inline bool dev_page_is_reusable(const struct page *page)
+{
+	return likely(page_to_nid(page) == numa_mem_id() &&
+		      !page_is_pfmemalloc(page));
+}
+
+/**
  *	skb_propagate_pfmemalloc - Propagate pfmemalloc if skb is allocated after RX page
  *	@page: The page that was allocated from skb_alloc_page
  *	@skb: The skb that may need pfmemalloc set
  */
-static inline void skb_propagate_pfmemalloc(struct page *page,
-					     struct sk_buff *skb)
+static inline void skb_propagate_pfmemalloc(const struct page *page,
+					    struct sk_buff *skb)
 {
 	if (page_is_pfmemalloc(page))
 		skb->pfmemalloc = true;
@@ -4221,6 +4243,15 @@ static inline void skb_ext_copy(struct sk_buff *dst, const struct sk_buff *src)
 {
 	skb_ext_put(dst);
 	__skb_ext_copy(dst, src);
+
+#ifdef CONFIG_XFRM
+	/* RHEL: Also copy the secpath, which was freed by
+	 * __rh_skb_ext_put(). Like in __rh_skb_ext_put(), we need to
+	 * expand the implementation of secpath_get(). */
+	if (src->sp)
+		refcount_inc((refcount_t *)src->sp);
+	dst->sp = src->sp;
+#endif
 }
 
 static inline bool __skb_ext_exist(const struct skb_ext *ext, enum skb_ext_id i)
@@ -4644,6 +4675,11 @@ static inline void skb_reset_redirect(struct sk_buff *skb)
 #ifdef CONFIG_NET_REDIRECT
 	skb->redirected = 0;
 #endif
+}
+
+static inline bool skb_csum_is_sctp(struct sk_buff *skb)
+{
+	return skb->csum_not_inet;
 }
 
 #endif	/* __KERNEL__ */

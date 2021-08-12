@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2020 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2021 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -664,11 +664,18 @@ struct lpfc_hba {
 	void (*lpfc_scsi_prep_cmnd)
 		(struct lpfc_vport *, struct lpfc_io_buf *,
 		 struct lpfc_nodelist *);
+	int (*lpfc_scsi_prep_cmnd_buf)
+		(struct lpfc_vport *vport,
+		 struct lpfc_io_buf *lpfc_cmd,
+		 uint8_t tmo);
 
 	/* IOCB interface function jump table entries */
 	int (*__lpfc_sli_issue_iocb)
 		(struct lpfc_hba *, uint32_t,
 		 struct lpfc_iocbq *, uint32_t);
+	int (*__lpfc_sli_issue_fcp_io)
+		(struct lpfc_hba *phba, uint32_t ring_number,
+		 struct lpfc_iocbq *piocb, uint32_t flag);
 	void (*__lpfc_sli_release_iocbq)(struct lpfc_hba *,
 			 struct lpfc_iocbq *);
 	int (*lpfc_hba_down_post)(struct lpfc_hba *phba);
@@ -772,6 +779,10 @@ struct lpfc_hba {
 					 */
 #define HBA_FLOGI_ISSUED	0x100000 /* FLOGI was issued */
 #define HBA_DEFER_FLOGI		0x800000 /* Defer FLOGI till read_sparm cmpl */
+#define HBA_NEEDS_CFG_PORT	0x2000000 /* SLI3 - needs a CONFIG_PORT mbox */
+#define HBA_HBEAT_INP		0x4000000 /* mbox HBEAT is in progress */
+#define HBA_HBEAT_TMO		0x8000000 /* HBEAT initiated after timeout */
+#define HBA_FLOGI_OUTSTANDING	0x10000000 /* FLOGI is outstanding */
 
 	uint32_t fcp_ring_in_use; /* When polling test if intr-hndlr active*/
 	struct lpfc_dmabuf slim2p;
@@ -1128,11 +1139,8 @@ struct lpfc_hba {
 	unsigned long last_completion_time;
 	unsigned long skipped_hb;
 	struct timer_list hb_tmofunc;
-	uint8_t hb_outstanding;
 	struct timer_list rrq_tmr;
 	enum hba_temp_state over_temp_state;
-	/* ndlp reference management */
-	spinlock_t ndlp_lock;
 	/*
 	 * Following bit will be set for all buffer tags which are not
 	 * associated with any HBQ.

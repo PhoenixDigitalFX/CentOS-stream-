@@ -80,8 +80,9 @@ static struct nfs_open_dir_context *alloc_nfs_open_dir_context(struct inode *dir
 		spin_lock(&dir->i_lock);
 		if (list_empty(&nfsi->open_files) &&
 		    (nfsi->cache_validity & NFS_INO_DATA_INVAL_DEFER))
-			nfsi->cache_validity |= NFS_INO_INVALID_DATA |
-				NFS_INO_REVAL_FORCED;
+			nfs_set_cache_invalid(dir,
+					      NFS_INO_INVALID_DATA |
+						      NFS_INO_REVAL_FORCED);
 		list_add(&ctx->list, &nfsi->open_files);
 		spin_unlock(&dir->i_lock);
 		return ctx;
@@ -725,7 +726,7 @@ static int nfs_readdir_page_filler(struct nfs_readdir_descriptor *desc,
 		return -ENOMEM;
 
 	xdr_init_decode_pages(&stream, &buf, xdr_pages, buflen);
-	xdr_set_scratch_buffer(&stream, page_address(scratch), PAGE_SIZE);
+	xdr_set_scratch_page(&stream, scratch);
 
 	do {
 		if (entry->label)
@@ -864,6 +865,8 @@ static int nfs_readdir_xdr_to_array(struct nfs_readdir_descriptor *desc,
 			break;
 		}
 
+		verf_arg = verf_res;
+
 		status = nfs_readdir_page_filler(desc, entry, pages, pglen,
 						 arrays, narrays);
 	} while (!status && nfs_readdir_page_needs_filling(page));
@@ -925,7 +928,12 @@ static int find_and_lock_cache_page(struct nfs_readdir_descriptor *desc)
 			}
 			return res;
 		}
-		memcpy(nfsi->cookieverf, verf, sizeof(nfsi->cookieverf));
+		/*
+		 * Set the cookie verifier if the page cache was empty
+		 */
+		if (desc->page_index == 0)
+			memcpy(nfsi->cookieverf, verf,
+			       sizeof(nfsi->cookieverf));
 	}
 	res = nfs_readdir_search_array(desc);
 	if (res == 0) {
@@ -972,10 +980,10 @@ static int readdir_search_pagecache(struct nfs_readdir_descriptor *desc)
 /*
  * Once we've found the start of the dirent within a page: fill 'er up...
  */
-static void nfs_do_filldir(struct nfs_readdir_descriptor *desc)
+static void nfs_do_filldir(struct nfs_readdir_descriptor *desc,
+			   const __be32 *verf)
 {
 	struct file	*file = desc->file;
-	struct nfs_inode *nfsi = NFS_I(file_inode(file));
 	struct nfs_cache_array *array;
 	unsigned int i = 0;
 
@@ -989,7 +997,7 @@ static void nfs_do_filldir(struct nfs_readdir_descriptor *desc)
 			desc->eof = true;
 			break;
 		}
-		memcpy(desc->verf, nfsi->cookieverf, sizeof(desc->verf));
+		memcpy(desc->verf, verf, sizeof(desc->verf));
 		if (i < (array->size-1))
 			desc->dir_cookie = array->array[i+1].cookie;
 		else
@@ -1046,7 +1054,7 @@ static int uncached_readdir(struct nfs_readdir_descriptor *desc)
 
 	for (i = 0; !desc->eof && i < sz && arrays[i]; i++) {
 		desc->page = arrays[i];
-		nfs_do_filldir(desc);
+		nfs_do_filldir(desc, verf);
 	}
 	desc->page = NULL;
 
@@ -1067,6 +1075,7 @@ static int nfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct dentry	*dentry = file_dentry(file);
 	struct inode	*inode = d_inode(dentry);
+	struct nfs_inode *nfsi = NFS_I(inode);
 	struct nfs_open_dir_context *dir_ctx = file->private_data;
 	struct nfs_readdir_descriptor *desc;
 	int res;
@@ -1120,7 +1129,7 @@ static int nfs_readdir(struct file *file, struct dir_context *ctx)
 			break;
 		}
 		if (res == -ETOOSMALL && desc->plus) {
-			clear_bit(NFS_INO_ADVISE_RDPLUS, &NFS_I(inode)->flags);
+			clear_bit(NFS_INO_ADVISE_RDPLUS, &nfsi->flags);
 			nfs_zap_caches(inode);
 			desc->page_index = 0;
 			desc->plus = false;
@@ -1130,7 +1139,7 @@ static int nfs_readdir(struct file *file, struct dir_context *ctx)
 		if (res < 0)
 			break;
 
-		nfs_do_filldir(desc);
+		nfs_do_filldir(desc, nfsi->cookieverf);
 		nfs_readdir_page_unlock_and_put_cached(desc);
 	} while (!desc->eof);
 
@@ -1400,6 +1409,13 @@ out_force:
 	goto out;
 }
 
+static void nfs_mark_dir_for_revalidate(struct inode *inode)
+{
+	spin_lock(&inode->i_lock);
+	nfs_set_cache_invalid(inode, NFS_INO_REVAL_PAGECACHE);
+	spin_unlock(&inode->i_lock);
+}
+
 /*
  * We judge how long we want to trust negative
  * dentries by looking at the parent inode mtime.
@@ -1434,19 +1450,14 @@ nfs_lookup_revalidate_done(struct inode *dir, struct dentry *dentry,
 			__func__, dentry);
 		return 1;
 	case 0:
-		nfs_mark_for_revalidate(dir);
-		if (inode && S_ISDIR(inode->i_mode)) {
-			/* Purge readdir caches. */
-			nfs_zap_caches(inode);
-			/*
-			 * We can't d_drop the root of a disconnected tree:
-			 * its d_hash is on the s_anon list and d_drop() would hide
-			 * it from shrink_dcache_for_unmount(), leading to busy
-			 * inodes on unmount and further oopses.
-			 */
-			if (IS_ROOT(dentry))
-				return 1;
-		}
+		/*
+		 * We can't d_drop the root of a disconnected tree:
+		 * its d_hash is on the s_anon list and d_drop() would hide
+		 * it from shrink_dcache_for_unmount(), leading to busy
+		 * inodes on unmount and further oopses.
+		 */
+		if (inode && IS_ROOT(dentry))
+			return 1;
 		dfprintk(LOOKUPCACHE, "NFS: %s(%pd2) is invalid\n",
 				__func__, dentry);
 		return 0;
@@ -1524,6 +1535,13 @@ out:
 	nfs_free_fattr(fattr);
 	nfs_free_fhandle(fhandle);
 	nfs4_label_free(label);
+
+	/*
+	 * If the lookup failed despite the dentry change attribute being
+	 * a match, then we should revalidate the directory cache.
+	 */
+	if (!ret && nfs_verify_change_attribute(dir, dentry->d_time))
+		nfs_mark_dir_for_revalidate(dir);
 	return nfs_lookup_revalidate_done(dir, dentry, inode, ret);
 }
 
@@ -1566,7 +1584,7 @@ nfs_do_lookup_revalidate(struct inode *dir, struct dentry *dentry,
 		error = nfs_lookup_verify_inode(inode, flags);
 		if (error) {
 			if (error == -ESTALE)
-				nfs_zap_caches(dir);
+				nfs_mark_dir_for_revalidate(dir);
 			goto out_bad;
 		}
 		nfs_advise_use_readdirplus(dir);
@@ -1690,10 +1708,9 @@ static void nfs_drop_nlink(struct inode *inode)
 	if (inode->i_nlink > 0)
 		drop_nlink(inode);
 	NFS_I(inode)->attr_gencount = nfs_inc_attr_generation_counter();
-	NFS_I(inode)->cache_validity |= NFS_INO_INVALID_CHANGE
-		| NFS_INO_INVALID_CTIME
-		| NFS_INO_INVALID_OTHER
-		| NFS_INO_REVAL_FORCED;
+	nfs_set_cache_invalid(
+		inode, NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_CTIME |
+			       NFS_INO_INVALID_OTHER | NFS_INO_REVAL_FORCED);
 	spin_unlock(&inode->i_lock);
 }
 
@@ -1705,7 +1722,7 @@ static void nfs_dentry_iput(struct dentry *dentry, struct inode *inode)
 {
 	if (S_ISDIR(inode->i_mode))
 		/* drop any readdir cache as it could easily be old */
-		NFS_I(inode)->cache_validity |= NFS_INO_INVALID_DATA;
+		nfs_set_cache_invalid(inode, NFS_INO_INVALID_DATA);
 
 	if (dentry->d_flags & DCACHE_NFSFS_RENAMED) {
 		nfs_complete_unlink(dentry, inode);
@@ -2061,7 +2078,6 @@ out:
 	dput(parent);
 	return d;
 out_error:
-	nfs_mark_for_revalidate(dir);
 	d = ERR_PTR(error);
 	goto out;
 }
@@ -2467,9 +2483,9 @@ int nfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (error == 0) {
 		spin_lock(&old_inode->i_lock);
 		NFS_I(old_inode)->attr_gencount = nfs_inc_attr_generation_counter();
-		NFS_I(old_inode)->cache_validity |= NFS_INO_INVALID_CHANGE
-			| NFS_INO_INVALID_CTIME
-			| NFS_INO_REVAL_FORCED;
+		nfs_set_cache_invalid(old_inode, NFS_INO_INVALID_CHANGE |
+							 NFS_INO_INVALID_CTIME |
+							 NFS_INO_REVAL_FORCED);
 		spin_unlock(&old_inode->i_lock);
 	}
 out:

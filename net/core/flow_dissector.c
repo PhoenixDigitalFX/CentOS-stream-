@@ -22,6 +22,7 @@
 #include <linux/if_ether.h>
 #include <linux/mpls.h>
 #include <linux/tcp.h>
+#include <linux/ptp_classify.h>
 #include <net/flow_dissector.h>
 #include <scsi/fc/fc_fcoe.h>
 #include <uapi/linux/batadv_packet.h>
@@ -178,7 +179,7 @@ void skb_flow_get_icmp_tci(const struct sk_buff *skb,
 	 * avoid confusion with packets without such field
 	 */
 	if (icmp_has_id(ih->type))
-		key_icmp->id = ih->un.echo.id ? : 1;
+		key_icmp->id = ih->un.echo.id ? ntohs(ih->un.echo.id) : 1;
 	else
 		key_icmp->id = 0;
 }
@@ -1052,6 +1053,9 @@ proto_again:
 			key_control->addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
 		}
 
+		__skb_flow_dissect_ipv4(skb, flow_dissector,
+					target_container, data, iph);
+
 		if (ip_is_fragment(iph)) {
 			key_control->flags |= FLOW_DIS_IS_FRAGMENT;
 
@@ -1067,9 +1071,6 @@ proto_again:
 				}
 			}
 		}
-
-		__skb_flow_dissect_ipv4(skb, flow_dissector,
-					target_container, data, iph);
 
 		break;
 	}
@@ -1252,6 +1253,21 @@ proto_again:
 		fdret = __skb_flow_dissect_batadv(skb, key_control, data,
 						  &proto, &nhoff, hlen, flags);
 		break;
+
+	case htons(ETH_P_1588): {
+		struct ptp_header *hdr, _hdr;
+
+		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data,
+					   hlen, &_hdr);
+		if (!hdr) {
+			fdret = FLOW_DISSECT_RET_OUT_BAD;
+			break;
+		}
+
+		nhoff += ntohs(hdr->message_length);
+		fdret = FLOW_DISSECT_RET_OUT_GOOD;
+		break;
+	}
 
 	default:
 		fdret = FLOW_DISSECT_RET_OUT_BAD;

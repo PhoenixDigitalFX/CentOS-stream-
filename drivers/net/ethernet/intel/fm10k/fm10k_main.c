@@ -8,6 +8,7 @@
 #include <net/tcp.h>
 #include <linux/if_macvlan.h>
 #include <linux/prefetch.h>
+#include <generated/utsrelease.h>
 
 #include "fm10k.h"
 
@@ -20,6 +21,7 @@ static const char fm10k_copyright[] =
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION(DRV_SUMMARY);
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION(UTS_RELEASE);
 
 /* single workqueue for entire fm10k driver */
 struct workqueue_struct *fm10k_workqueue;
@@ -194,17 +196,12 @@ static void fm10k_reuse_rx_page(struct fm10k_ring *rx_ring,
 					 DMA_FROM_DEVICE);
 }
 
-static inline bool fm10k_page_is_reserved(struct page *page)
-{
-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
-}
-
 static bool fm10k_can_reuse_rx_page(struct fm10k_rx_buffer *rx_buffer,
 				    struct page *page,
 				    unsigned int __maybe_unused truesize)
 {
-	/* avoid re-using remote pages */
-	if (unlikely(fm10k_page_is_reserved(page)))
+	/* avoid re-using remote and pfmemalloc pages */
+	if (!dev_page_is_reusable(page))
 		return false;
 
 #if (PAGE_SIZE < 8192)
@@ -265,8 +262,8 @@ static bool fm10k_add_rx_frag(struct fm10k_rx_buffer *rx_buffer,
 	if (likely(size <= FM10K_RX_HDR_LEN)) {
 		memcpy(__skb_put(skb, size), va, ALIGN(size, sizeof(long)));
 
-		/* page is not reserved, we can reuse buffer as-is */
-		if (likely(!fm10k_page_is_reserved(page)))
+		/* page is reusable, we can reuse buffer as-is */
+		if (dev_page_is_reusable(page))
 			return true;
 
 		/* this page cannot be reused so discard it */

@@ -72,6 +72,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Broadcom BCM573xx network driver");
+MODULE_VERSION(DRV_MODULE_VERSION);
 
 #define BNXT_RX_OFFSET (NET_SKB_PAD + NET_IP_ALIGN)
 #define BNXT_RX_DMA_OFFSET NET_SKB_PAD
@@ -2844,7 +2845,7 @@ static int bnxt_alloc_rx_rings(struct bnxt *bp)
 		if (rc)
 			return rc;
 
-		rc = xdp_rxq_info_reg(&rxr->xdp_rxq, bp->dev, i);
+		rc = xdp_rxq_info_reg(&rxr->xdp_rxq, bp->dev, i, 0);
 		if (rc < 0)
 			return rc;
 
@@ -8638,10 +8639,9 @@ static void bnxt_del_napi(struct bnxt *bp)
 	for (i = 0; i < bp->cp_nr_rings; i++) {
 		struct bnxt_napi *bnapi = bp->bnapi[i];
 
-		napi_hash_del(&bnapi->napi);
-		netif_napi_del(&bnapi->napi);
+		__netif_napi_del(&bnapi->napi);
 	}
-	/* We called napi_hash_del() before netif_napi_del(), we need
+	/* We called __netif_napi_del(), we need
 	 * to respect an RCU grace period before freeing napi structures.
 	 */
 	synchronize_net();

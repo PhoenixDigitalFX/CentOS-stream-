@@ -207,6 +207,13 @@ static inline void update_avg(u64 *avg, u64 sample)
 }
 
 /*
+ * Shifting a value by an exponent greater *or equal* to the size of said value
+ * is UB; cap at size-1.
+ */
+#define shr_bound(val, shift)							\
+	(val >> min_t(typeof(shift), shift, BITS_PER_TYPE(typeof(val)) - 1))
+
+/*
  * !! For sched_setattr_nocheck() (kernel) only !!
  *
  * This is actually gross. :(
@@ -1679,13 +1686,21 @@ static inline int task_on_rq_migrating(struct task_struct *p)
 	return READ_ONCE(p->on_rq) == TASK_ON_RQ_MIGRATING;
 }
 
-/*
- * wake flags
- */
-#define WF_SYNC			0x01		/* Waker goes to sleep after wakeup */
-#define WF_FORK			0x02		/* Child wakeup after fork */
-#define WF_MIGRATED		0x04		/* Internal use, task got migrated */
-#define WF_ON_CPU		0x08		/* Wakee is on_cpu */
+/* Wake flags. The first three directly map to some SD flag value */
+/* RHEL8 these are modified so they map correctly */
+#define WF_EXEC     0x04 /* Wakeup after exec; maps to SD_BALANCE_EXEC */
+#define WF_FORK     0x08 /* Wakeup after fork; maps to SD_BALANCE_FORK */
+#define WF_TTWU     0x10 /* Wakeup;            maps to SD_BALANCE_WAKE */
+
+#define WF_SYNC     0x02 /* Waker goes to sleep after wakeup */
+#define WF_MIGRATED 0x20 /* Internal use, task got migrated */
+#define WF_ON_CPU   0x40 /* Wakee is on_cpu */
+
+#ifdef CONFIG_SMP
+static_assert(WF_EXEC == SD_BALANCE_EXEC);
+static_assert(WF_FORK == SD_BALANCE_FORK);
+static_assert(WF_TTWU == SD_BALANCE_WAKE);
+#endif
 
 /*
  * To aid in avoiding the subversion of "niceness" due to uneven distribution
@@ -1759,7 +1774,8 @@ struct sched_class {
 	void (*put_prev_task)(struct rq *rq, struct task_struct *p);
 
 #ifdef CONFIG_SMP
-	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+	RH_KABI_REPLACE(int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags),\
+			int  (*select_task_rq)(struct task_struct *p, int task_cpu, int flags))
 	RH_KABI_REPLACE(void (*migrate_task_rq)(struct task_struct *p),\
 			void (*migrate_task_rq)(struct task_struct *p, int new_cpu))
 

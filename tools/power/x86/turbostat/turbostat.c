@@ -1176,7 +1176,14 @@ int format_counters(struct thread_data *t, struct core_data *c,
 		}
 	}
 
-	fmt8 = "%s%.2f";
+	/*
+	 * If measurement interval exceeds minimum RAPL Joule Counter range,
+	 * indicate that results are suspect by printing "**" in fraction place.
+	 */
+	if (interval_float < rapl_joule_counter_range)
+		fmt8 = "%s%.2f";
+	else
+		fmt8 = "%6.0f**";
 
 	if (DO_BIC(BIC_CorWatt) && (do_rapl & RAPL_PER_CORE_ENERGY))
 		outp += sprintf(outp, fmt8, (printed++ ? delim : ""), c->core_energy * rapl_energy_units / interval_float);
@@ -1831,6 +1838,33 @@ int get_mp(int cpu, struct msr_counter *mp, unsigned long long *counterp)
 	return 0;
 }
 
+int get_epb(int cpu)
+{
+	char path[128 + PATH_BYTES];
+	unsigned long long msr;
+	int ret, epb = -1;
+	FILE *fp;
+
+	sprintf(path, "/sys/devices/system/cpu/cpu%d/power/energy_perf_bias", cpu);
+
+	fp = fopen(path, "r");
+	if (!fp)
+		goto msr_fallback;
+
+	ret = fscanf(fp, "%d", &epb);
+	if (ret != 1)
+		err(1, "%s(%s)", __func__, path);
+
+	fclose(fp);
+
+	return epb;
+
+msr_fallback:
+	get_msr(cpu, MSR_IA32_ENERGY_PERF_BIAS, &msr);
+
+	return msr & 0xf;
+}
+
 void get_apic_id(struct thread_data *t)
 {
 	unsigned int eax, ebx, ecx, edx;
@@ -2076,39 +2110,39 @@ retry:
 		p->sys_lpi = cpuidle_cur_sys_lpi_us;
 
 	if (do_rapl & RAPL_PKG) {
-		if (get_msr_sum(cpu, MSR_PKG_ENERGY_STATUS, &msr))
+		if (get_msr(cpu, MSR_PKG_ENERGY_STATUS, &msr))
 			return -13;
-		p->energy_pkg = msr;
+		p->energy_pkg = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_CORES_ENERGY_STATUS) {
-		if (get_msr_sum(cpu, MSR_PP0_ENERGY_STATUS, &msr))
+		if (get_msr(cpu, MSR_PP0_ENERGY_STATUS, &msr))
 			return -14;
-		p->energy_cores = msr;
+		p->energy_cores = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_DRAM) {
-		if (get_msr_sum(cpu, MSR_DRAM_ENERGY_STATUS, &msr))
+		if (get_msr(cpu, MSR_DRAM_ENERGY_STATUS, &msr))
 			return -15;
-		p->energy_dram = msr;
+		p->energy_dram = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_GFX) {
-		if (get_msr_sum(cpu, MSR_PP1_ENERGY_STATUS, &msr))
+		if (get_msr(cpu, MSR_PP1_ENERGY_STATUS, &msr))
 			return -16;
-		p->energy_gfx = msr;
+		p->energy_gfx = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_PKG_PERF_STATUS) {
-		if (get_msr_sum(cpu, MSR_PKG_PERF_STATUS, &msr))
+		if (get_msr(cpu, MSR_PKG_PERF_STATUS, &msr))
 			return -16;
-		p->rapl_pkg_perf_status = msr;
+		p->rapl_pkg_perf_status = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_DRAM_PERF_STATUS) {
-		if (get_msr_sum(cpu, MSR_DRAM_PERF_STATUS, &msr))
+		if (get_msr(cpu, MSR_DRAM_PERF_STATUS, &msr))
 			return -16;
-		p->rapl_dram_perf_status = msr;
+		p->rapl_dram_perf_status = msr & 0xFFFFFFFF;
 	}
 	if (do_rapl & RAPL_AMD_F17H) {
-		if (get_msr_sum(cpu, MSR_PKG_ENERGY_STAT, &msr))
+		if (get_msr(cpu, MSR_PKG_ENERGY_STAT, &msr))
 			return -13;
-		p->energy_pkg = msr;
+		p->energy_pkg = msr & 0xFFFFFFFF;
 	}
 	if (DO_BIC(BIC_PkgTmp)) {
 		if (get_msr(cpu, MSR_IA32_PACKAGE_THERM_STATUS, &msr))
@@ -3917,9 +3951,8 @@ dump_sysfs_pstate_config(void)
  */
 int print_epb(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 {
-	unsigned long long msr;
 	char *epb_string;
-	int cpu;
+	int cpu, epb;
 
 	if (!has_epb)
 		return 0;
@@ -3935,10 +3968,11 @@ int print_epb(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 		return -1;
 	}
 
-	if (get_msr(cpu, MSR_IA32_ENERGY_PERF_BIAS, &msr))
+	epb = get_epb(cpu);
+	if (epb < 0)
 		return 0;
 
-	switch (msr & 0xF) {
+	switch (epb) {
 	case ENERGY_PERF_BIAS_PERFORMANCE:
 		epb_string = "performance";
 		break;
@@ -3952,7 +3986,7 @@ int print_epb(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 		epb_string = "custom";
 		break;
 	}
-	fprintf(outf, "cpu%d: MSR_IA32_ENERGY_PERF_BIAS: 0x%08llx (%s)\n", cpu, msr, epb_string);
+	fprintf(outf, "cpu%d: EPB: %d (%s)\n", cpu, epb, epb_string);
 
 	return 0;
 }
@@ -4967,12 +5001,14 @@ unsigned int intel_model_duplicates(unsigned int model)
 	case INTEL_FAM6_ROCKETLAKE:
 	case INTEL_FAM6_LAKEFIELD:
 	case INTEL_FAM6_ALDERLAKE:
+	case INTEL_FAM6_ALDERLAKE_L:
 		return INTEL_FAM6_CANNONLAKE_L;
 
 	case INTEL_FAM6_ATOM_TREMONT_L:
 		return INTEL_FAM6_ATOM_TREMONT;
 
 	case INTEL_FAM6_ICELAKE_X:
+	case INTEL_FAM6_ICELAKE_D:
 	case INTEL_FAM6_SAPPHIRERAPIDS_X:
 		return INTEL_FAM6_SKYLAKE_X;
 	}
@@ -5290,7 +5326,7 @@ void process_cpuid()
 	if (!quiet)
 		dump_sysfs_pstate_config();
 
-	if (has_skl_msrs(family, model))
+	if (has_skl_msrs(family, model) || is_ehl(family, model))
 		calculate_tsc_tweak();
 
 	if (!access("/sys/class/drm/card0/power/rc6_residency_ms", R_OK))
@@ -6194,7 +6230,6 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	msr_sum_record();
 	/*
 	 * if any params left, it must be a command to fork
 	 */

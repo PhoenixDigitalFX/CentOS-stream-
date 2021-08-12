@@ -251,12 +251,52 @@ static noinline void check_xa_mark_1(struct xarray *xa, unsigned long index)
 	XA_BUG_ON(xa, !xa_empty(xa));
 }
 
+static noinline void check_xa_mark_2(struct xarray *xa)
+{
+	XA_STATE(xas, xa, 0);
+	unsigned long index;
+	unsigned int count = 0;
+	void *entry;
+
+	xa_store_index(xa, 0, GFP_KERNEL);
+	xa_set_mark(xa, 0, XA_MARK_0);
+	xas_lock(&xas);
+	xas_load(&xas);
+	xas_init_marks(&xas);
+	xas_unlock(&xas);
+	XA_BUG_ON(xa, !xa_get_mark(xa, 0, XA_MARK_0) == 0);
+
+	for (index = 3500; index < 4500; index++) {
+		xa_store_index(xa, index, GFP_KERNEL);
+		xa_set_mark(xa, index, XA_MARK_0);
+	}
+
+	xas_reset(&xas);
+	rcu_read_lock();
+	xas_for_each_marked(&xas, entry, ULONG_MAX, XA_MARK_0)
+		count++;
+	rcu_read_unlock();
+	XA_BUG_ON(xa, count != 1000);
+
+	xas_lock(&xas);
+	xas_for_each(&xas, entry, ULONG_MAX) {
+		xas_init_marks(&xas);
+		XA_BUG_ON(xa, !xa_get_mark(xa, xas.xa_index, XA_MARK_0));
+		XA_BUG_ON(xa, !xas_get_mark(&xas, XA_MARK_0));
+	}
+	xas_unlock(&xas);
+
+	xa_destroy(xa);
+}
+
 static noinline void check_xa_mark(struct xarray *xa)
 {
 	unsigned long index;
 
 	for (index = 0; index < 16384; index += 4)
 		check_xa_mark_1(xa, index);
+
+	check_xa_mark_2(xa);
 }
 
 static noinline void check_xa_shrink(struct xarray *xa)
@@ -1465,24 +1505,24 @@ static noinline void check_store_range(struct xarray *xa)
 
 #ifdef CONFIG_XARRAY_MULTI
 static void check_split_1(struct xarray *xa, unsigned long index,
-							unsigned int order)
+				unsigned int order, unsigned int new_order)
 {
-	XA_STATE(xas, xa, index);
-	void *entry;
-	unsigned int i = 0;
+	XA_STATE_ORDER(xas, xa, index, new_order);
+	unsigned int i;
 
 	xa_store_order(xa, index, order, xa, GFP_KERNEL);
 
 	xas_split_alloc(&xas, xa, order, GFP_KERNEL);
 	xas_lock(&xas);
 	xas_split(&xas, xa, order);
+	for (i = 0; i < (1 << order); i += (1 << new_order))
+		__xa_store(xa, index + i, xa_mk_index(index + i), 0);
 	xas_unlock(&xas);
 
-	xa_for_each(xa, index, entry) {
-		XA_BUG_ON(xa, entry != xa);
-		i++;
+	for (i = 0; i < (1 << order); i++) {
+		unsigned int val = index + (i & ~((1 << new_order) - 1));
+		XA_BUG_ON(xa, xa_load(xa, index + i) != xa_mk_index(val));
 	}
-	XA_BUG_ON(xa, i != 1 << order);
 
 	xa_set_mark(xa, index, XA_MARK_0);
 	XA_BUG_ON(xa, !xa_get_mark(xa, index, XA_MARK_0));
@@ -1492,14 +1532,16 @@ static void check_split_1(struct xarray *xa, unsigned long index,
 
 static noinline void check_split(struct xarray *xa)
 {
-	unsigned int order;
+	unsigned int order, new_order;
 
 	XA_BUG_ON(xa, !xa_empty(xa));
 
 	for (order = 1; order < 2 * XA_CHUNK_SHIFT; order++) {
-		check_split_1(xa, 0, order);
-		check_split_1(xa, 1UL << order, order);
-		check_split_1(xa, 3UL << order, order);
+		for (new_order = 0; new_order < order; new_order++) {
+			check_split_1(xa, 0, order, new_order);
+			check_split_1(xa, 1UL << order, order, new_order);
+			check_split_1(xa, 3UL << order, order, new_order);
+		}
 	}
 }
 #else

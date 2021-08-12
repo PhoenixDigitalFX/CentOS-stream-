@@ -10,12 +10,12 @@ jobs:
     - centos-stream-8-x86_64
   trigger: pull_request
 sources:
-- path: kernel-abi-stablelists-4.18.0-301.tar.bz2
-  url: https://git.centos.org/sources/kernel/c8s/e3d72dde4d6053052269c5b00689c20dbb3dea65
-- path: kernel-kabi-dw-4.18.0-301.tar.bz2
-  url: https://git.centos.org/sources/kernel/c8s/109f15ce9699bfa93bd9dc4f8e88013ce341e0e7
-- path: linux-4.18.0-301.1.el8.tar.xz
-  url: https://git.centos.org/sources/kernel/c8s/6638ce9a7952baff7e62ab27c20087a7b402a44e
+- path: kernel-abi-stablelists-4.18.0-326.tar.bz2
+  url: https://git.centos.org/sources/kernel/c8s/41eebda7027bb4148fed32b7ea695f5e7c26cc70
+- path: kernel-kabi-dw-4.18.0-326.tar.bz2
+  url: https://git.centos.org/sources/kernel/c8s/85e6f13547b123f72574e3c6f7446d1ab67c95e6
+- path: linux-4.18.0-326.el8.tar.xz
+  url: https://git.centos.org/sources/kernel/c8s/a1dbf97ee80c7f43518fef2e8d455f81a41c0645
 - path: rheldup3.x509
   url: https://git.centos.org/sources/kernel/c8s/95b9b811c7b0a6c98b2eafc4e7d6d24f2cb63289
 - path: rhelkpatch1.x509

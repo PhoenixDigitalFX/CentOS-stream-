@@ -109,6 +109,11 @@ static inline bool bio_integrity_endio(struct bio *bio)
 	return true;
 }
 
+bool blk_integrity_merge_rq(struct request_queue *, struct request *,
+		struct request *);
+bool blk_integrity_merge_bio(struct request_queue *, struct request *,
+		struct bio *);
+
 static inline bool integrity_req_gap_back_merge(struct request *req,
 		struct bio *next)
 {
@@ -132,6 +137,16 @@ static inline bool integrity_req_gap_front_merge(struct request *req,
 void blk_integrity_add(struct gendisk *);
 void blk_integrity_del(struct gendisk *);
 #else /* CONFIG_BLK_DEV_INTEGRITY */
+static inline bool blk_integrity_merge_rq(struct request_queue *rq,
+		struct request *r1, struct request *r2)
+{
+	return true;
+}
+static inline bool blk_integrity_merge_bio(struct request_queue *rq,
+		struct request *r, struct bio *b)
+{
+	return true;
+}
 static inline bool integrity_req_gap_back_merge(struct request *req,
 		struct bio *next)
 {
@@ -172,6 +187,8 @@ bool bio_attempt_discard_merge(struct request_queue *q, struct request *req,
 		struct bio *bio);
 bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
 			    struct request **same_queue_rq);
+bool blk_bio_list_merge(struct request_queue *q, struct list_head *list,
+			struct bio *bio);
 
 void blk_account_io_start(struct request *req);
 void blk_account_io_done(struct request *req, u64 now);
@@ -351,7 +368,7 @@ char *disk_name(struct gendisk *hd, int partno, char *buf);
 #define ADDPART_FLAG_NONE	0
 #define ADDPART_FLAG_RAID	1
 #define ADDPART_FLAG_WHOLEDISK	2
-void delete_partition(struct gendisk *disk, struct hd_struct *part);
+void delete_partition(struct hd_struct *part);
 int bdev_add_partition(struct block_device *bdev, int partno,
 		sector_t start, sector_t length);
 int bdev_del_partition(struct block_device *bdev, int partno);

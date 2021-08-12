@@ -636,7 +636,7 @@ void i40e_clean_tx_ring(struct i40e_ring *tx_ring)
 	unsigned long bi_size;
 	u16 i;
 
-	if (ring_is_xdp(tx_ring) && tx_ring->xsk_umem) {
+	if (ring_is_xdp(tx_ring) && tx_ring->xsk_pool) {
 		i40e_xsk_clean_tx_ring(tx_ring);
 	} else {
 		/* ring already cleared, nothing to do */
@@ -1335,7 +1335,7 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 		rx_ring->skb = NULL;
 	}
 
-	if (rx_ring->xsk_umem) {
+	if (rx_ring->xsk_pool) {
 		i40e_xsk_clean_rx_ring(rx_ring);
 		goto skip_free;
 	}
@@ -1369,7 +1369,7 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 	}
 
 skip_free:
-	if (rx_ring->xsk_umem)
+	if (rx_ring->xsk_pool)
 		i40e_clear_rx_bi_zc(rx_ring);
 	else
 		i40e_clear_rx_bi(rx_ring);
@@ -1436,7 +1436,7 @@ int i40e_setup_rx_descriptors(struct i40e_ring *rx_ring)
 	/* XDP RX-queue info only needed for RX rings exposed to XDP */
 	if (rx_ring->vsi->type == I40E_VSI_MAIN) {
 		err = xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev,
-				       rx_ring->queue_index);
+				       rx_ring->queue_index, rx_ring->q_vector->napi.napi_id);
 		if (err < 0)
 			return err;
 	}
@@ -1833,19 +1833,6 @@ static bool i40e_cleanup_headers(struct i40e_ring *rx_ring, struct sk_buff *skb,
 }
 
 /**
- * i40e_page_is_reusable - check if any reuse is possible
- * @page: page struct to check
- *
- * A page is not reusable if it was allocated under low memory
- * conditions, or it's not in the same NUMA node as this CPU.
- */
-static inline bool i40e_page_is_reusable(struct page *page)
-{
-	return (page_to_nid(page) == numa_mem_id()) &&
-		!page_is_pfmemalloc(page);
-}
-
-/**
  * i40e_can_reuse_rx_page - Determine if this page can be reused by
  * the adapter for another receive
  *
@@ -1880,7 +1867,7 @@ static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer,
 	struct page *page = rx_buffer->page;
 
 	/* Is any reuse possible? */
-	if (unlikely(!i40e_page_is_reusable(page)))
+	if (!dev_page_is_reusable(page))
 		return false;
 
 #if (PAGE_SIZE < 8192)
@@ -2600,7 +2587,7 @@ int i40e_napi_poll(struct napi_struct *napi, int budget)
 	 * budget and be more aggressive about cleaning up the Tx descriptors.
 	 */
 	i40e_for_each_ring(ring, q_vector->tx) {
-		bool wd = ring->xsk_umem ?
+		bool wd = ring->xsk_pool ?
 			  i40e_clean_xdp_tx_irq(vsi, ring) :
 			  i40e_clean_tx_irq(vsi, ring, budget);
 
@@ -2628,7 +2615,7 @@ int i40e_napi_poll(struct napi_struct *napi, int budget)
 		budget_per_ring = budget;
 
 	i40e_for_each_ring(ring, q_vector->rx) {
-		int cleaned = ring->xsk_umem ?
+		int cleaned = ring->xsk_pool ?
 			      i40e_clean_rx_irq_zc(ring, budget_per_ring) :
 			      i40e_clean_rx_irq(ring, budget_per_ring);
 
