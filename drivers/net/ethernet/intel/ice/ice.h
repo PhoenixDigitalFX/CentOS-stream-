@@ -53,10 +53,10 @@
 #include "ice_sched.h"
 #include "ice_virtchnl_pf.h"
 #include "ice_sriov.h"
+#include "ice_ptp.h"
 #include "ice_fdir.h"
 #include "ice_xsk.h"
 #include "ice_arfs.h"
-#include "ice_lag.h"
 
 #define ICE_BAR0		0
 #define ICE_REQ_DESC_MULTIPLE	32
@@ -68,12 +68,13 @@
 
 #define ICE_DFLT_TRAFFIC_CLASS	BIT(0)
 #define ICE_INT_NAME_STR_LEN	(IFNAMSIZ + 16)
-#define ICE_AQ_LEN		64
+#define ICE_AQ_LEN		192
 #define ICE_MBXSQ_LEN		64
+#define ICE_SBQ_LEN		64
 #define ICE_MIN_LAN_TXRX_MSIX	1
 #define ICE_MIN_LAN_OICR_MSIX	1
 #define ICE_MIN_MSIX		(ICE_MIN_LAN_TXRX_MSIX + ICE_MIN_LAN_OICR_MSIX)
-#define ICE_FDIR_MSIX		1
+#define ICE_FDIR_MSIX		2
 #define ICE_NO_VSI		0xffff
 #define ICE_VSI_MAP_CONTIG	0
 #define ICE_VSI_MAP_SCATTER	1
@@ -84,9 +85,12 @@
 #define ICE_MAX_LG_RSS_QS	256
 #define ICE_RES_VALID_BIT	0x8000
 #define ICE_RES_MISC_VEC_ID	(ICE_RES_VALID_BIT - 1)
+/* All VF control VSIs share the same IRQ, so assign a unique ID for them */
+#define ICE_RES_VF_CTRL_VEC_ID	(ICE_RES_MISC_VEC_ID - 1)
 #define ICE_INVAL_Q_INDEX	0xffff
 #define ICE_INVAL_VFID		256
 
+#define ICE_MAX_RXQS_PER_TC		256	/* Used when setting VSI context per TC Rx queues */
 #define ICE_MAX_RESET_WAIT		20
 
 #define ICE_VSIQF_HKEY_ARRAY_SIZE	((VSIQF_HKEY_MAX_INDEX + 1) *	4)
@@ -190,7 +194,7 @@ struct ice_sw {
 	u8 dflt_vsi_ena:1;	/* true if above dflt_vsi is enabled */
 };
 
-enum ice_state {
+enum ice_pf_state {
 	__ICE_TESTING,
 	__ICE_DOWN,
 	__ICE_NEEDS_RESTART,
@@ -215,10 +219,12 @@ enum ice_state {
 	__ICE_STATE_NOMINAL_CHECK_BITS,
 	__ICE_ADMINQ_EVENT_PENDING,
 	__ICE_MAILBOXQ_EVENT_PENDING,
+	ICE_SIDEBANDQ_EVENT_PENDING,
 	__ICE_MDD_EVENT_PENDING,
 	__ICE_VFLR_EVENT_PENDING,
 	__ICE_FLTR_OVERFLOW_PROMISC,
 	__ICE_VF_DIS,
+	ICE_VF_DEINIT_IN_PROGRESS,
 	__ICE_CFG_BUSY,
 	__ICE_SERVICE_SCHED,
 	__ICE_SERVICE_DIS,
@@ -228,15 +234,18 @@ enum ice_state {
 	__ICE_VF_RESETS_DISABLED,	/* disable resets during ice_remove */
 	__ICE_LINK_DEFAULT_OVERRIDE_PENDING,
 	__ICE_PHY_INIT_COMPLETE,
+	__ICE_FD_VF_FLUSH_CTX,		/* set at FD Rx IRQ or timeout */
 	__ICE_STATE_NBITS		/* must be last */
 };
 
-enum ice_vsi_flags {
-	ICE_VSI_FLAG_UMAC_FLTR_CHANGED,
-	ICE_VSI_FLAG_MMAC_FLTR_CHANGED,
-	ICE_VSI_FLAG_VLAN_FLTR_CHANGED,
-	ICE_VSI_FLAG_PROMISC_CHANGED,
-	ICE_VSI_FLAG_NBITS		/* must be last */
+enum ice_vsi_state {
+	ICE_VSI_DOWN,
+	ICE_VSI_NEEDS_RESTART,
+	ICE_VSI_UMAC_FLTR_CHANGED,
+	ICE_VSI_MMAC_FLTR_CHANGED,
+	ICE_VSI_VLAN_FLTR_CHANGED,
+	ICE_VSI_PROMISC_CHANGED,
+	ICE_VSI_STATE_NBITS		/* must be last */
 };
 
 /* struct that defines a VSI, associated with a dev */
@@ -252,8 +261,7 @@ struct ice_vsi {
 	irqreturn_t (*irq_handler)(int irq, void *data);
 
 	u64 tx_linearize;
-	DECLARE_BITMAP(state, __ICE_STATE_NBITS);
-	DECLARE_BITMAP(flags, ICE_VSI_FLAG_NBITS);
+	DECLARE_BITMAP(state, ICE_VSI_STATE_NBITS);
 	unsigned int current_netdev_flags;
 	u32 tx_restart;
 	u32 tx_busy;
@@ -368,6 +376,8 @@ enum ice_pf_flags {
 	ICE_FLAG_DCB_CAPABLE,
 	ICE_FLAG_DCB_ENA,
 	ICE_FLAG_FD_ENA,
+	ICE_FLAG_PTP_SUPPORTED,		/* PTP is supported by NVM */
+	ICE_FLAG_PTP,			/* PTP is enabled by software */
 	ICE_FLAG_ADV_FEATURES,
 	ICE_FLAG_LINK_DOWN_ON_CLOSE_ENA,
 	ICE_FLAG_TOTAL_PORT_SHUTDOWN_ENA,
@@ -415,6 +425,7 @@ struct ice_pf {
 	u16 num_msix_per_vf;
 	/* used to ratelimit the MDD event logging */
 	unsigned long last_printed_mdd_jiffies;
+	DECLARE_BITMAP(malvfs, ICE_MAX_VF_COUNT);
 	DECLARE_BITMAP(state, __ICE_STATE_NBITS);
 	DECLARE_BITMAP(flags, ICE_PF_FLAGS_NBITS);
 	unsigned long *avail_txqs;	/* bitmap to track PF Tx queue usage */
@@ -427,6 +438,7 @@ struct ice_pf {
 	struct mutex sw_mutex;		/* lock for protecting VSI alloc flow */
 	struct mutex tc_mutex;		/* lock to protect TC changes */
 	u32 msg_enable;
+	struct ice_ptp ptp;
 
 	/* spinlock to protect the AdminQ wait list */
 	spinlock_t aq_wait_lock;
@@ -464,7 +476,6 @@ struct ice_pf {
 	__le64 nvm_phy_type_lo; /* NVM PHY type low */
 	__le64 nvm_phy_type_hi; /* NVM PHY type high */
 	struct ice_link_default_override_tlv link_dflt_override;
-	struct ice_lag *lag; /* Link Aggregation information */
 
 #define ICE_INVALID_AGG_NODE_ID		0
 #define ICE_PF_AGG_NODE_ID_START	1
@@ -500,7 +511,7 @@ ice_irq_dynamic_ena(struct ice_hw *hw, struct ice_vsi *vsi,
 	val = GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
 	      (itr << GLINT_DYN_CTL_ITR_INDX_S);
 	if (vsi)
-		if (test_bit(__ICE_DOWN, vsi->state))
+		if (test_bit(ICE_VSI_DOWN, vsi->state))
 			return;
 	wr32(hw, GLINT_DYN_CTL(vector), val);
 }
@@ -574,31 +585,11 @@ static inline struct ice_vsi *ice_get_ctrl_vsi(struct ice_pf *pf)
 	return pf->vsi[pf->ctrl_vsi_idx];
 }
 
-/**
- * ice_set_sriov_cap - enable SRIOV in PF flags
- * @pf: PF struct
- */
-static inline void ice_set_sriov_cap(struct ice_pf *pf)
-{
-	if (pf->hw.func_caps.common_cap.sr_iov_1_1)
-		set_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags);
-}
-
-/**
- * ice_clear_sriov_cap - disable SRIOV in PF flags
- * @pf: PF struct
- */
-static inline void ice_clear_sriov_cap(struct ice_pf *pf)
-{
-	clear_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags);
-}
-
 #define ICE_FD_STAT_CTR_BLOCK_COUNT	256
 #define ICE_FD_STAT_PF_IDX(base_idx) \
 			((base_idx) * ICE_FD_STAT_CTR_BLOCK_COUNT)
 #define ICE_FD_SB_STAT_IDX(base_idx) ICE_FD_STAT_PF_IDX(base_idx)
 
-bool netif_is_ice(struct net_device *dev);
 int ice_vsi_setup_tx_rings(struct ice_vsi *vsi);
 int ice_vsi_setup_rx_rings(struct ice_vsi *vsi);
 int ice_vsi_open_ctrl(struct ice_vsi *vsi);
@@ -618,8 +609,10 @@ int ice_destroy_xdp_rings(struct ice_vsi *vsi);
 int
 ice_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 	     u32 flags);
-int ice_set_rss(struct ice_vsi *vsi, u8 *seed, u8 *lut, u16 lut_size);
-int ice_get_rss(struct ice_vsi *vsi, u8 *seed, u8 *lut, u16 lut_size);
+int ice_set_rss_lut(struct ice_vsi *vsi, u8 *lut, u16 lut_size);
+int ice_get_rss_lut(struct ice_vsi *vsi, u8 *lut, u16 lut_size);
+int ice_set_rss_key(struct ice_vsi *vsi, u8 *seed);
+int ice_get_rss_key(struct ice_vsi *vsi, u8 *seed);
 void ice_fill_rss_lut(u8 *lut, u16 rss_table_size, u16 rss_size);
 int ice_schedule_reset(struct ice_pf *pf, enum ice_reset_req reset);
 void ice_print_link_msg(struct ice_vsi *vsi, bool isup);

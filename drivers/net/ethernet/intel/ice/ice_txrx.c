@@ -309,7 +309,7 @@ static bool ice_clean_tx_irq(struct ice_ring *tx_ring, int napi_budget)
 		smp_mb();
 		if (__netif_subqueue_stopped(tx_ring->netdev,
 					     tx_ring->q_index) &&
-		    !test_bit(__ICE_DOWN, vsi->state)) {
+		    !test_bit(ICE_VSI_DOWN, vsi->state)) {
 			netif_wake_subqueue(tx_ring->netdev,
 					    tx_ring->q_index);
 			++tx_ring->tx_stats.restart_q;
@@ -591,7 +591,7 @@ ice_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 	struct ice_ring *xdp_ring;
 	int drops = 0, i;
 
-	if (test_bit(__ICE_DOWN, vsi->state))
+	if (test_bit(ICE_VSI_DOWN, vsi->state))
 		return -ENETDOWN;
 
 	if (!ice_is_xdp_ena_vsi(vsi) || queue_index >= vsi->num_xdp_txq)
@@ -1075,7 +1075,7 @@ ice_is_non_eop(struct ice_ring *rx_ring, union ice_32b_rx_flex_desc *rx_desc)
  */
 int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
 {
-	unsigned int total_rx_bytes = 0, total_rx_pkts = 0;
+	unsigned int total_rx_bytes = 0, total_rx_pkts = 0, frame_sz = 0;
 	u16 cleaned_count = ICE_DESC_UNUSED(rx_ring);
 	unsigned int xdp_res, xdp_xmit = 0;
 	struct sk_buff *skb = rx_ring->skb;
@@ -1083,16 +1083,18 @@ int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
 	struct xdp_buff xdp;
 	bool failure;
 
-	xdp.rxq = &rx_ring->xdp_rxq;
 	/* Frame size depend on rx_ring setup when PAGE_SIZE=4K */
 #if (PAGE_SIZE < 8192)
-	xdp.frame_sz = ice_rx_frame_truesize(rx_ring, 0);
+	frame_sz = ice_rx_frame_truesize(rx_ring, 0);
 #endif
+	xdp_init_buff(&xdp, frame_sz, &rx_ring->xdp_rxq);
 
 	/* start the loop to process Rx packets bounded by 'budget' */
 	while (likely(total_rx_pkts < (unsigned int)budget)) {
+		unsigned int offset = ice_rx_offset(rx_ring);
 		union ice_32b_rx_flex_desc *rx_desc;
 		struct ice_rx_buf *rx_buf;
+		unsigned char *hard_start;
 		unsigned int size;
 		u16 stat_err_bits;
 		int rx_buf_pgcnt;
@@ -1118,6 +1120,11 @@ int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
 		dma_rmb();
 
 		if (rx_desc->wb.rxdid == FDIR_DESC_RXDID || !rx_ring->netdev) {
+			struct ice_vsi *ctrl_vsi = rx_ring->vsi;
+
+			if (rx_desc->wb.rxdid == FDIR_DESC_RXDID &&
+			    ctrl_vsi->vf_id != ICE_INVAL_VFID)
+				ice_vc_fdir_irq_handler(ctrl_vsi, rx_desc);
 			ice_put_rx_buf(rx_ring, NULL, 0);
 			cleaned_count++;
 			continue;
@@ -1137,10 +1144,9 @@ int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
 			goto construct_skb;
 		}
 
-		xdp.data = page_address(rx_buf->page) + rx_buf->page_offset;
-		xdp.data_hard_start = xdp.data - ice_rx_offset(rx_ring);
-		xdp.data_meta = xdp.data;
-		xdp.data_end = xdp.data + size;
+		hard_start = page_address(rx_buf->page) + rx_buf->page_offset -
+			     offset;
+		xdp_prepare_buff(&xdp, hard_start, offset, size, true);
 #if (PAGE_SIZE > 4096)
 		/* At larger PAGE_SIZE, frame_sz depend on len size */
 		xdp.frame_sz = ice_rx_frame_truesize(rx_ring, size);
@@ -1537,7 +1543,7 @@ static void ice_update_ena_itr(struct ice_q_vector *q_vector)
 			q_vector->itr_countdown--;
 	}
 
-	if (!test_bit(__ICE_DOWN, vsi->state))
+	if (!test_bit(ICE_VSI_DOWN, vsi->state))
 		wr32(&vsi->back->hw, GLINT_DYN_CTL(q_vector->reg_idx), itr_val);
 }
 
@@ -2340,6 +2346,41 @@ static bool ice_chk_linearize(struct sk_buff *skb, unsigned int count)
 }
 
 /**
+ * ice_tstamp - set up context descriptor for hardware timestamp
+ * @tx_ring: pointer to the Tx ring to send buffer on
+ * @skb: pointer to the SKB we're sending
+ * @first: Tx buffer
+ * @off: Tx offload parameters
+ */
+static void
+ice_tstamp(struct ice_ring *tx_ring, struct sk_buff *skb,
+	   struct ice_tx_buf *first, struct ice_tx_offload_params *off)
+{
+	s8 idx;
+
+	/* only timestamp the outbound packet if the user has requested it */
+	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)))
+		return;
+
+	if (!tx_ring->ptp_tx)
+		return;
+
+	/* Tx timestamps cannot be sampled when doing TSO */
+	if (first->tx_flags & ICE_TX_FLAGS_TSO)
+		return;
+
+	/* Grab an open timestamp slot */
+	idx = ice_ptp_request_ts(tx_ring->tx_tstamps, skb);
+	if (idx < 0)
+		return;
+
+	off->cd_qw1 |= (u64)(ICE_TX_DESC_DTYPE_CTX |
+			     (ICE_TX_CTX_DESC_TSYN << ICE_TXD_CTX_QW1_CMD_S) |
+			     ((u64)idx << ICE_TXD_CTX_QW1_TSO_LEN_S));
+	first->tx_flags |= ICE_TX_FLAGS_TSYN;
+}
+
+/**
  * ice_xmit_frame_ring - Sends buffer on Tx ring
  * @skb: send buffer
  * @tx_ring: ring to send buffer on
@@ -2407,6 +2448,8 @@ ice_xmit_frame_ring(struct sk_buff *skb, struct ice_ring *tx_ring)
 		offload.cd_qw1 |= (u64)(ICE_TX_DESC_DTYPE_CTX |
 					ICE_TX_CTX_DESC_SWTCH_UPLINK <<
 					ICE_TXD_CTX_QW1_CMD_S);
+
+	ice_tstamp(tx_ring, skb, first, &offload);
 
 	if (offload.cd_qw1 & ICE_TX_DESC_DTYPE_CTX) {
 		struct ice_tx_ctx_desc *cdesc;

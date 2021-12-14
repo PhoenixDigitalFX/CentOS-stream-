@@ -168,9 +168,19 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
 		 * in blk_mq_dispatch_rq_list().
 		 */
 		list_add_tail(&rq->queuelist, &rq_list);
+		count++;
 		if (rq->mq_hctx != hctx)
 			multi_hctxs = true;
-	} while (++count < max_dispatch);
+
+		/*
+		 * If we cannot get tag for the request, stop dequeueing
+		 * requests from the IO scheduler. We are unlikely to be able
+		 * to submit them anyway and it creates false impression for
+		 * scheduling heuristics that the device can take more IO.
+		 */
+		if (!blk_mq_get_driver_tag(rq))
+			break;
+	} while (count < max_dispatch);
 
 	if (!count) {
 		if (run_queue)
@@ -720,6 +730,7 @@ void blk_mq_exit_sched(struct request_queue *q, struct elevator_queue *e)
 {
 	struct blk_mq_hw_ctx *hctx;
 	unsigned int i;
+	unsigned int flags = 0;
 
 	queue_for_each_hw_ctx(q, hctx, i) {
 		blk_mq_debugfs_unregister_sched_hctx(hctx);
@@ -727,12 +738,13 @@ void blk_mq_exit_sched(struct request_queue *q, struct elevator_queue *e)
 			e->type->ops.exit_hctx(hctx, i);
 			hctx->sched_data = NULL;
 		}
+		flags = hctx->flags;
 	}
 	blk_mq_debugfs_unregister_sched(q);
 	if (e->type->ops.exit_sched)
 		e->type->ops.exit_sched(e);
 	blk_mq_sched_tags_teardown(q);
-	if (blk_mq_is_sbitmap_shared(q->tag_set->flags))
+	if (blk_mq_is_sbitmap_shared(flags))
 		blk_mq_exit_sched_shared_sbitmap(q);
 	q->elevator = NULL;
 }

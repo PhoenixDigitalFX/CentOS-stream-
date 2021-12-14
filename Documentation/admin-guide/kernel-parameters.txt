@@ -897,7 +897,7 @@
 			INIT from AP to BSP.
 
 	disable_ddw	[PPC/PSERIES]
-			Disable Dynamic DMA Window support. Use this if
+			Disable Dynamic DMA Window support. Use this
 			to workaround buggy firmware.
 
 	disable_ipv6=	[IPV6]
@@ -4387,11 +4387,6 @@
 			Reserves a hole at the top of the kernel virtual
 			address space.
 
-	reservelow=	[X86]
-			Format: nn[K]
-			Set the amount of memory to reserve for BIOS at
-			the bottom of the address space.
-
 	reset_devices	[KNL] Force drivers to reset the underlying device
 			during initialization.
 
@@ -4868,6 +4863,14 @@
 				  that trigger the #AC exception or the #DB
 				  exception. Default behavior is by #AC if
 				  both features are enabled in hardware.
+
+			ratelimit:N -
+				  Set system wide rate limit to N bus locks
+				  per second for bus lock detection.
+				  0 < N <= 1000.
+
+				  N/A for split lock detection.
+
 
 			If an #AC exception is hit in the kernel or in
 			firmware (i.e. not while executing in user mode)

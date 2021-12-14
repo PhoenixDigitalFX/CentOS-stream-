@@ -2218,6 +2218,26 @@ static inline void skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
 	sk_mem_charge(sk, skb->truesize);
 }
 
+static inline __must_check bool skb_set_owner_sk_safe(struct sk_buff *skb, struct sock *sk)
+{
+	if (sk && refcount_inc_not_zero(&sk->sk_refcnt)) {
+		skb_orphan(skb);
+		skb->destructor = sock_efree;
+		skb->sk = sk;
+		return true;
+	}
+	return false;
+}
+
+static inline void skb_prepare_for_gro(struct sk_buff *skb)
+{
+	if (skb->destructor != sock_wfree) {
+		skb_orphan(skb);
+		return;
+	}
+	skb->slow_gro = 1;
+}
+
 void sk_reset_timer(struct sock *sk, struct timer_list *timer,
 		    unsigned long expires);
 
@@ -2658,6 +2678,7 @@ int sock_set_timestamping(struct sock *sk, int optname, int val);
 void sock_no_linger(struct sock *sk);
 void sock_set_keepalive(struct sock *sk);
 void sock_set_priority(struct sock *sk, u32 priority);
+void sock_set_mark(struct sock *sk, u32 val);
 void sock_set_reuseaddr(struct sock *sk);
 
 #endif	/* _SOCK_H */

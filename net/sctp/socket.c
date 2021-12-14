@@ -4721,6 +4721,7 @@ static int sctp_setsockopt_encap_port(struct sock *sk,
 				    transports)
 			t->encap_port = encap_port;
 
+		asoc->encap_port = encap_port;
 		return 0;
 	}
 
@@ -4768,6 +4769,10 @@ static int sctp_setsockopt(struct sock *sk, int level, int optname,
 	}
 
 	if (optlen > 0) {
+		/* Trim it to the biggest size sctp sockopt may need if necessary */
+		optlen = min_t(unsigned int, optlen,
+			       PAGE_ALIGN(USHRT_MAX +
+					  sizeof(__u16) * sizeof(struct sctp_reset_streams)));
 		kopt = memdup_user(optval, optlen);
 		if (IS_ERR(kopt))
 			return PTR_ERR(kopt);

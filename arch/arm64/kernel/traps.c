@@ -18,9 +18,11 @@
  */
 
 #include <linux/bug.h>
+#include <linux/context_tracking.h>
 #include <linux/signal.h>
 #include <linux/personality.h>
 #include <linux/kallsyms.h>
+#include <linux/kprobes.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/hardirq.h>
@@ -456,6 +458,9 @@ static void user_cache_maint_handler(unsigned int esr, struct pt_regs *regs)
 	case ESR_ELx_SYS64_ISS_CRM_DC_CVAC:	/* DC CVAC, gets promoted */
 		__user_cache_maint("dc civac", address, ret);
 		break;
+	case ESR_ELx_SYS64_ISS_CRM_DC_CVADP:	/* DC CVADP */
+		__user_cache_maint("sys 3, c7, c13, 1", address, ret);
+		break;
 	case ESR_ELx_SYS64_ISS_CRM_DC_CVAP:	/* DC CVAP */
 		__user_cache_maint("sys 3, c7, c12, 1", address, ret);
 		break;
@@ -543,6 +548,19 @@ static struct sys64_hook sys64_hooks[] = {
 	},
 	{},
 };
+
+
+#ifdef CONFIG_COMPAT
+asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
+{
+	/*
+	 * New cp15 instructions may previously have been undefined at
+	 * EL0. Fall back to our usual undefined instruction handler
+	 * so that we handle these consistently.
+	 */
+	do_undefinstr(regs);
+}
+#endif
 
 asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
 {
@@ -735,6 +753,13 @@ asmlinkage void do_serror(struct pt_regs *regs, unsigned int esr)
 
 	nmi_exit();
 }
+
+asmlinkage void enter_from_user_mode(void)
+{
+	CT_WARN_ON(ct_state() != CONTEXT_USER);
+	user_exit_irqoff();
+}
+NOKPROBE_SYMBOL(enter_from_user_mode);
 
 void __pte_error(const char *file, int line, unsigned long val)
 {

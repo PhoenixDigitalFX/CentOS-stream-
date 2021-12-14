@@ -15,6 +15,7 @@
 #include <linux/perf_event.h>
 
 #include <asm/intel_ds.h>
+#include <asm/cpu.h>
 
 /* To enable MSR tracing please use the generic trace points. */
 
@@ -133,7 +134,7 @@ struct amd_nb {
 	PERF_SAMPLE_DATA_SRC | PERF_SAMPLE_IDENTIFIER | \
 	PERF_SAMPLE_TRANSACTION | PERF_SAMPLE_PHYS_ADDR | \
 	PERF_SAMPLE_REGS_INTR | PERF_SAMPLE_REGS_USER | \
-	PERF_SAMPLE_PERIOD)
+	PERF_SAMPLE_PERIOD | PERF_SAMPLE_CODE_PAGE_SIZE)
 
 #define PEBS_GP_REGS			\
 	((1ULL << PERF_REG_X86_AX)    | \
@@ -281,6 +282,7 @@ struct cpu_hw_events {
 	void				*last_task_ctx;
 	int				last_log_id;
 	int				lbr_select;
+	void				*lbr_xsave;
 
 	/*
 	 * Intel host/guest exclude bits
@@ -326,6 +328,8 @@ struct cpu_hw_events {
 	int				n_pair; /* Large increment events */
 
 	void				*kfree_on_online[X86_PERF_KFREE_MAX];
+
+	struct pmu			*pmu;
 };
 
 #define __EVENT_CONSTRAINT_RANGE(c, e, n, m, w, o, f) {	\
@@ -629,6 +633,84 @@ enum {
 	x86_lbr_exclusive_max,
 };
 
+struct x86_hybrid_pmu {
+	struct pmu			pmu;
+	const char			*name;
+	u8				cpu_type;
+	cpumask_t			supported_cpus;
+	union perf_capabilities		intel_cap;
+	u64				intel_ctrl;
+	int				max_pebs_events;
+	int				num_counters;
+	int				num_counters_fixed;
+	struct event_constraint		unconstrained;
+
+	u64				hw_cache_event_ids
+					[PERF_COUNT_HW_CACHE_MAX]
+					[PERF_COUNT_HW_CACHE_OP_MAX]
+					[PERF_COUNT_HW_CACHE_RESULT_MAX];
+	u64				hw_cache_extra_regs
+					[PERF_COUNT_HW_CACHE_MAX]
+					[PERF_COUNT_HW_CACHE_OP_MAX]
+					[PERF_COUNT_HW_CACHE_RESULT_MAX];
+	struct event_constraint		*event_constraints;
+	struct event_constraint		*pebs_constraints;
+	struct extra_reg		*extra_regs;
+
+	unsigned int			late_ack	:1,
+					mid_ack		:1;
+};
+
+static __always_inline struct x86_hybrid_pmu *hybrid_pmu(struct pmu *pmu)
+{
+	return container_of(pmu, struct x86_hybrid_pmu, pmu);
+}
+
+extern struct static_key_false perf_is_hybrid;
+#define is_hybrid()		static_branch_unlikely(&perf_is_hybrid)
+
+#define hybrid(_pmu, _field)				\
+(*({							\
+	typeof(&x86_pmu._field) __Fp = &x86_pmu._field;	\
+							\
+	if (is_hybrid() && (_pmu))			\
+		__Fp = &hybrid_pmu(_pmu)->_field;	\
+							\
+	__Fp;						\
+}))
+
+#define hybrid_var(_pmu, _var)				\
+(*({							\
+	typeof(&_var) __Fp = &_var;			\
+							\
+	if (is_hybrid() && (_pmu))			\
+		__Fp = &hybrid_pmu(_pmu)->_var;		\
+							\
+	__Fp;						\
+}))
+
+#define hybrid_bit(_pmu, _field)			\
+({							\
+	bool __Fp = x86_pmu._field;			\
+							\
+	if (is_hybrid() && (_pmu))			\
+		__Fp = hybrid_pmu(_pmu)->_field;	\
+							\
+	__Fp;						\
+})
+
+enum hybrid_pmu_type {
+	hybrid_big		= 0x40,
+	hybrid_small		= 0x20,
+
+	hybrid_big_small	= hybrid_big | hybrid_small,
+};
+
+#define X86_HYBRID_PMU_ATOM_IDX		0
+#define X86_HYBRID_PMU_CORE_IDX		1
+
+#define X86_HYBRID_NUM_PMUS		2
+
 /*
  * struct x86_pmu - generic x86 pmu
  */
@@ -685,7 +767,8 @@ struct x86_pmu {
 	u64		(*limit_period)(struct perf_event *event, u64 l);
 
 	/* PMI handler bits */
-	unsigned int	late_ack		:1;
+	unsigned int	late_ack		:1,
+					mid_ack			:1;
 
 	/*
 	 * sysfs attrs
@@ -819,6 +902,19 @@ struct x86_pmu {
 	int (*check_period) (struct perf_event *event, u64 period);
 
 	int (*aux_output_match) (struct perf_event *event);
+
+	int (*filter_match)(struct perf_event *event);
+	/*
+	 * Hybrid support
+	 *
+	 * Most PMU capabilities are the same among different hybrid PMUs.
+	 * The global x86_pmu saves the architecture capabilities, which
+	 * are available for all PMUs. The hybrid_pmu only includes the
+	 * unique capabilities.
+	 */
+	int				num_hybrid_pmus;
+	struct x86_hybrid_pmu		*hybrid_pmu;
+	u8 (*get_hybrid_cpu_type)	(void);
 };
 
 struct x86_perf_task_context_opt {
@@ -838,6 +934,27 @@ struct x86_perf_task_context {
 struct x86_perf_task_context_arch_lbr {
 	struct x86_perf_task_context_opt opt;
 	struct lbr_entry entries[];
+};
+
+/*
+ * Add padding to guarantee the 64-byte alignment of the state buffer.
+ *
+ * The structure is dynamically allocated. The size of the LBR state may vary
+ * based on the number of LBR registers.
+ *
+ * Do not put anything after the LBR state.
+ */
+struct x86_perf_task_context_arch_lbr_xsave {
+	struct x86_perf_task_context_opt		opt;
+
+	union {
+		struct xregs_state			xsave;
+		struct {
+			struct fxregs_state		i387;
+			struct xstate_header		header;
+			struct arch_lbr_state		lbr;
+		} __attribute__ ((packed, aligned (XSAVE_ALIGNMENT)));
+	};
 };
 
 #define x86_add_quirk(func_)						\
@@ -887,7 +1004,23 @@ static struct perf_pmu_events_ht_attr event_attr_##v = {		\
 	.event_str_ht	= ht,						\
 }
 
-struct pmu *x86_get_pmu(void);
+#define EVENT_ATTR_STR_HYBRID(_name, v, str, _pmu)			\
+static struct perf_pmu_events_hybrid_attr event_attr_##v = {		\
+	.attr		= __ATTR(_name, 0444, events_hybrid_sysfs_show, NULL),\
+	.id		= 0,						\
+	.event_str	= str,						\
+	.pmu_type	= _pmu,						\
+}
+
+#define FORMAT_HYBRID_PTR(_id) (&format_attr_hybrid_##_id.attr.attr)
+
+#define FORMAT_ATTR_HYBRID(_name, _pmu)					\
+static struct perf_pmu_format_hybrid_attr format_attr_hybrid_##_name = {\
+	.attr		= __ATTR_RO(_name),				\
+	.pmu_type	= _pmu,						\
+}
+
+struct pmu *x86_get_pmu(unsigned int cpu);
 extern struct x86_pmu x86_pmu __read_mostly;
 
 static __always_inline struct x86_perf_task_context_opt *task_context_opt(void *ctx)
@@ -946,6 +1079,9 @@ static inline int x86_pmu_rdpmc_index(int index)
 	return x86_pmu.rdpmc_index ? x86_pmu.rdpmc_index(index) : index;
 }
 
+bool check_hw_exists(struct pmu *pmu, int num_counters,
+		     int num_counters_fixed);
+
 int x86_add_exclusive(unsigned int what);
 
 void x86_del_exclusive(unsigned int what);
@@ -997,9 +1133,10 @@ void x86_pmu_stop(struct perf_event *event, int flags);
 
 static inline void x86_pmu_disable_event(struct perf_event *event)
 {
+	u64 disable_mask = __this_cpu_read(cpu_hw_events.perf_ctr_virt_mask);
 	struct hw_perf_event *hwc = &event->hw;
 
-	wrmsrl(hwc->config_base, hwc->config);
+	wrmsrl(hwc->config_base, hwc->config & ~disable_mask);
 
 	if (is_counter_pair(hwc))
 		wrmsrl(x86_pmu_config_addr(hwc->idx + 1), 0);
@@ -1008,6 +1145,11 @@ static inline void x86_pmu_disable_event(struct perf_event *event)
 void x86_pmu_enable_event(struct perf_event *event);
 
 int x86_pmu_handle_irq(struct pt_regs *regs);
+
+void x86_pmu_show_pmu_cap(int num_counters, int num_counters_fixed,
+			  u64 intel_ctrl);
+
+void x86_pmu_update_cpu_context(struct pmu *pmu, int cpu);
 
 extern struct event_constraint emptyconstraint;
 
@@ -1049,10 +1191,15 @@ ssize_t events_sysfs_show(struct device *dev, struct device_attribute *attr,
 			  char *page);
 ssize_t events_ht_sysfs_show(struct device *dev, struct device_attribute *attr,
 			  char *page);
+ssize_t events_hybrid_sysfs_show(struct device *dev,
+				 struct device_attribute *attr,
+				 char *page);
 
-static inline bool fixed_counter_disabled(int i)
+static inline bool fixed_counter_disabled(int i, struct pmu *pmu)
 {
-	return !(x86_pmu.intel_ctrl >> (i + INTEL_PMC_IDX_FIXED));
+	u64 intel_ctrl = hybrid(pmu, intel_ctrl);
+
+	return !(intel_ctrl >> (i + INTEL_PMC_IDX_FIXED));
 }
 
 #ifdef CONFIG_CPU_SUP_AMD
@@ -1115,6 +1262,10 @@ void release_ds_buffers(void);
 
 void reserve_ds_buffers(void);
 
+void release_lbr_buffers(void);
+
+void reserve_lbr_buffers(void);
+
 extern struct event_constraint bts_constraint;
 extern struct event_constraint vlbr_constraint;
 
@@ -1133,6 +1284,8 @@ extern struct event_constraint intel_slm_pebs_event_constraints[];
 extern struct event_constraint intel_glm_pebs_event_constraints[];
 
 extern struct event_constraint intel_glp_pebs_event_constraints[];
+
+extern struct event_constraint intel_grt_pebs_event_constraints[];
 
 extern struct event_constraint intel_nehalem_pebs_event_constraints[];
 
@@ -1255,6 +1408,14 @@ static inline void reserve_ds_buffers(void)
 }
 
 static inline void release_ds_buffers(void)
+{
+}
+
+static inline void release_lbr_buffers(void)
+{
+}
+
+static inline void reserve_lbr_buffers(void)
 {
 }
 
