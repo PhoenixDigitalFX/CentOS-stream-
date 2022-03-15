@@ -64,6 +64,7 @@ struct cpuhp_cpu_state {
 	bool			single;
 	bool			bringup;
 	bool			booted_once;
+	int			cpu;
 	struct hlist_node	*node;
 	struct hlist_node	*last;
 	enum cpuhp_state	cb_state;
@@ -327,6 +328,13 @@ void lockdep_assert_cpus_held(void)
 	percpu_rwsem_assert_held(&cpu_hotplug_lock);
 }
 
+#ifdef CONFIG_LOCKDEP
+int lockdep_is_cpus_held(void)
+{
+	return percpu_rwsem_is_held(&cpu_hotplug_lock);
+}
+#endif
+
 static void lockdep_acquire_cpus_lock(void)
 {
 	rwsem_acquire(&cpu_hotplug_lock.dep_map, 0, 0, _THIS_IP_);
@@ -450,13 +458,16 @@ static inline enum cpuhp_state
 cpuhp_set_state(struct cpuhp_cpu_state *st, enum cpuhp_state target)
 {
 	enum cpuhp_state prev_state = st->state;
+	bool bringup = st->state < target;
 
 	st->rollback = false;
 	st->last = NULL;
 
 	st->target = target;
 	st->single = false;
-	st->bringup = st->state < target;
+	st->bringup = bringup;
+	if (cpu_dying(st->cpu) != !bringup)
+		set_cpu_dying(st->cpu, !bringup);
 
 	return prev_state;
 }
@@ -464,6 +475,8 @@ cpuhp_set_state(struct cpuhp_cpu_state *st, enum cpuhp_state target)
 static inline void
 cpuhp_reset_state(struct cpuhp_cpu_state *st, enum cpuhp_state prev_state)
 {
+	bool bringup = !st->bringup;
+
 	st->rollback = true;
 
 	/*
@@ -478,7 +491,9 @@ cpuhp_reset_state(struct cpuhp_cpu_state *st, enum cpuhp_state prev_state)
 	}
 
 	st->target = prev_state;
-	st->bringup = !st->bringup;
+	st->bringup = bringup;
+	if (cpu_dying(st->cpu) != !bringup)
+		set_cpu_dying(st->cpu, !bringup);
 }
 
 /* Regular hotplug invocation of the AP hotplug thread */
@@ -614,6 +629,7 @@ static void cpuhp_create(unsigned int cpu)
 
 	init_completion(&st->done_up);
 	init_completion(&st->done_down);
+	st->cpu = cpu;
 }
 
 static int cpuhp_should_run(unsigned int cpu)
@@ -1483,7 +1499,7 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 		.name			= "ap:online",
 	},
 	/*
-	 * Handled on controll processor until the plugged processor manages
+	 * Handled on control processor until the plugged processor manages
 	 * this itself.
 	 */
 	[CPUHP_TEARDOWN_CPU] = {
@@ -1492,6 +1508,13 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 		.teardown.single	= takedown_cpu,
 		.cant_stop		= true,
 	},
+
+	[CPUHP_AP_SCHED_WAIT_EMPTY] = {
+		.name			= "sched:waitempty",
+		.startup.single		= NULL,
+		.teardown.single	= sched_cpu_wait_empty,
+	},
+
 	/* Handle smpboot threads park/unpark */
 	[CPUHP_AP_SMPBOOT_THREADS] = {
 		.name			= "smpboot/threads:online",
@@ -2315,6 +2338,12 @@ EXPORT_SYMBOL(__cpu_present_mask);
 struct cpumask __cpu_active_mask __read_mostly;
 EXPORT_SYMBOL(__cpu_active_mask);
 
+struct cpumask __cpu_dying_mask __read_mostly;
+EXPORT_SYMBOL(__cpu_dying_mask);
+
+atomic_t __num_online_cpus __read_mostly;
+EXPORT_SYMBOL(__num_online_cpus);
+
 void init_cpu_present(const struct cpumask *src)
 {
 	cpumask_copy(&__cpu_present_mask, src);
@@ -2328,6 +2357,27 @@ void init_cpu_possible(const struct cpumask *src)
 void init_cpu_online(const struct cpumask *src)
 {
 	cpumask_copy(&__cpu_online_mask, src);
+}
+
+void set_cpu_online(unsigned int cpu, bool online)
+{
+	/*
+	 * atomic_inc/dec() is required to handle the horrid abuse of this
+	 * function by the reboot and kexec code which invoke it from
+	 * IPI/NMI broadcasts when shutting down CPUs. Invocation from
+	 * regular CPU hotplug is properly serialized.
+	 *
+	 * Note, that the fact that __num_online_cpus is of type atomic_t
+	 * does not protect readers which are not serialized against
+	 * concurrent hotplug operations.
+	 */
+	if (online) {
+		if (!cpumask_test_and_set_cpu(cpu, &__cpu_online_mask))
+			atomic_inc(&__num_online_cpus);
+	} else {
+		if (cpumask_test_and_clear_cpu(cpu, &__cpu_online_mask))
+			atomic_dec(&__num_online_cpus);
+	}
 }
 
 /*

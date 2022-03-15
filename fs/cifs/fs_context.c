@@ -122,6 +122,7 @@ const struct fs_parameter_spec smb3_fs_parameters[] = {
 	fsparam_flag("modefromsid", Opt_modesid),
 	fsparam_flag("rootfs", Opt_rootfs),
 	fsparam_flag("compress", Opt_compress),
+	fsparam_flag("witness", Opt_witness),
 
 	/* Mount options which take numeric value */
 	fsparam_u32("backupuid", Opt_backupuid),
@@ -428,7 +429,7 @@ int smb3_parse_opt(const char *options, const char *key, char **val)
 			if (nval == p)
 				continue;
 			*nval++ = 0;
-			*val = kstrndup(nval, strlen(nval), GFP_KERNEL);
+			*val = kstrdup(nval, GFP_KERNEL);
 			rc = !*val ? -ENOMEM : 0;
 			goto out;
 		}
@@ -436,6 +437,42 @@ int smb3_parse_opt(const char *options, const char *key, char **val)
 out:
 	kfree(orig);
 	return rc;
+}
+
+/*
+ * Remove duplicate path delimiters. Windows is supposed to do that
+ * but there are some bugs that prevent rename from working if there are
+ * multiple delimiters.
+ *
+ * Returns a sanitized duplicate of @path. The caller is responsible for
+ * cleaning up the original.
+ */
+#define IS_DELIM(c) ((c) == '/' || (c) == '\\')
+static char *sanitize_path(char *path)
+{
+	char *cursor1 = path, *cursor2 = path;
+
+	/* skip all prepended delimiters */
+	while (IS_DELIM(*cursor1))
+		cursor1++;
+
+	/* copy the first letter */
+	*cursor2 = *cursor1;
+
+	/* copy the remainder... */
+	while (*(cursor1++)) {
+		/* ... skipping all duplicated delimiters */
+		if (IS_DELIM(*cursor1) && IS_DELIM(*cursor2))
+			continue;
+		*(++cursor2) = *cursor1;
+	}
+
+	/* if the last character is a delimiter, skip it */
+	if (IS_DELIM(*(cursor2 - 1)))
+		cursor2--;
+
+	*(cursor2) = '\0';
+	return kstrdup(path, GFP_KERNEL);
 }
 
 /*
@@ -491,7 +528,7 @@ smb3_parse_devname(const char *devname, struct smb3_fs_context *ctx)
 	if (!*pos)
 		return 0;
 
-	ctx->prepath = kstrdup(pos, GFP_KERNEL);
+	ctx->prepath = sanitize_path(pos);
 	if (!ctx->prepath)
 		return -ENOMEM;
 
@@ -1216,6 +1253,13 @@ static int smb3_fs_context_parse_param(struct fs_context *fc,
 	case Opt_cache:
 		if (cifs_parse_cache_flavor(fc, param->string, ctx) != 0)
 			goto cifs_parse_mount_err;
+		break;
+	case Opt_witness:
+#ifndef CONFIG_CIFS_SWN_UPCALL
+		cifs_dbg(VFS, "Witness support needs CONFIG_CIFS_SWN_UPCALL config option\n");
+			goto cifs_parse_mount_err;
+#endif
+		ctx->witness = true;
 		break;
 	case Opt_rootfs:
 #ifndef CONFIG_CIFS_ROOT

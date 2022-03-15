@@ -194,17 +194,18 @@ u8 ice_dcb_get_tc(struct ice_vsi *vsi, int queue_index)
  */
 void ice_vsi_cfg_dcb_rings(struct ice_vsi *vsi)
 {
-	struct ice_ring *tx_ring, *rx_ring;
+	struct ice_tx_ring *tx_ring;
+	struct ice_rx_ring *rx_ring;
 	u16 qoffset, qcount;
 	int i, n;
 
 	if (!test_bit(ICE_FLAG_DCB_ENA, vsi->back->flags)) {
 		/* Reset the TC information */
-		for (i = 0; i < vsi->num_txq; i++) {
+		ice_for_each_txq(vsi, i) {
 			tx_ring = vsi->tx_rings[i];
 			tx_ring->dcb_tc = 0;
 		}
-		for (i = 0; i < vsi->num_rxq; i++) {
+		ice_for_each_rxq(vsi, i) {
 			rx_ring = vsi->rx_rings[i];
 			rx_ring->dcb_tc = 0;
 		}
@@ -275,6 +276,7 @@ int ice_pf_dcb_cfg(struct ice_pf *pf, struct ice_dcbx_cfg *new_cfg, bool locked)
 	struct ice_dcbx_cfg *old_cfg, *curr_cfg;
 	struct device *dev = ice_pf_to_dev(pf);
 	int ret = ICE_DCB_NO_HW_CHG;
+	struct iidc_event *event;
 	struct ice_vsi *pf_vsi;
 
 	curr_cfg = &pf->hw.port_info->qos_cfg.local_dcbx_cfg;
@@ -312,6 +314,17 @@ int ice_pf_dcb_cfg(struct ice_pf *pf, struct ice_dcbx_cfg *new_cfg, bool locked)
 		ret = -EINVAL;
 		goto free_cfg;
 	}
+
+	/* Notify AUX drivers about impending change to TCs */
+	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	if (!event) {
+		ret = -ENOMEM;
+		goto free_cfg;
+	}
+
+	set_bit(IIDC_EVENT_BEFORE_TC_CHANGE, event->type);
+	ice_send_event_to_aux(pf, event);
+	kfree(event);
 
 	/* avoid race conditions by holding the lock while disabling and
 	 * re-enabling the VSI
@@ -532,7 +545,7 @@ static int ice_dcb_init_cfg(struct ice_pf *pf, bool locked)
  * @ets_willing: configure ETS willing
  * @locked: was this function called with RTNL held
  */
-static int ice_dcb_sw_dflt_cfg(struct ice_pf *pf, bool ets_willing, bool locked)
+int ice_dcb_sw_dflt_cfg(struct ice_pf *pf, bool ets_willing, bool locked)
 {
 	struct ice_aqc_port_ets_elem buf = { 0 };
 	struct ice_dcbx_cfg *dcbcfg;
@@ -563,7 +576,7 @@ static int ice_dcb_sw_dflt_cfg(struct ice_pf *pf, bool ets_willing, bool locked)
 	dcbcfg->numapps = 1;
 	dcbcfg->app[0].selector = ICE_APP_SEL_ETHTYPE;
 	dcbcfg->app[0].priority = 3;
-	dcbcfg->app[0].prot_id = ICE_APP_PROT_ID_FCOE;
+	dcbcfg->app[0].prot_id = ETH_P_FCOE;
 
 	ret = ice_pf_dcb_cfg(pf, dcbcfg, locked);
 	kfree(dcbcfg);
@@ -640,6 +653,7 @@ static int ice_dcb_noncontig_cfg(struct ice_pf *pf)
 void ice_pf_dcb_recfg(struct ice_pf *pf)
 {
 	struct ice_dcbx_cfg *dcbcfg = &pf->hw.port_info->qos_cfg.local_dcbx_cfg;
+	struct iidc_event *event;
 	u8 tc_map = 0;
 	int v, ret;
 
@@ -675,6 +689,14 @@ void ice_pf_dcb_recfg(struct ice_pf *pf)
 		if (vsi->type == ICE_VSI_PF)
 			ice_dcbnl_set_all(vsi);
 	}
+	/* Notify the AUX drivers that TC change is finished */
+	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	if (!event)
+		return;
+
+	set_bit(IIDC_EVENT_AFTER_TC_CHANGE, event->type);
+	ice_send_event_to_aux(pf, event);
+	kfree(event);
 }
 
 /**
@@ -705,6 +727,11 @@ int ice_init_pf_dcb(struct ice_pf *pf, bool locked)
 		/* FW LLDP is disabled, activate SW DCBX/LLDP mode */
 		dev_info(dev, "FW LLDP is disabled, DCBx/LLDP in SW mode.\n");
 		clear_bit(ICE_FLAG_FW_LLDP_AGENT, pf->flags);
+		err = ice_aq_set_pfc_mode(&pf->hw, ICE_AQC_PFC_VLAN_BASED_PFC,
+					  NULL);
+		if (err)
+			dev_info(dev, "Failed to set VLAN PFC mode\n");
+
 		err = ice_dcb_sw_dflt_cfg(pf, true, locked);
 		if (err) {
 			dev_err(dev, "Failed to set local DCB config %d\n",
@@ -793,7 +820,7 @@ void ice_update_dcb_stats(struct ice_pf *pf)
  * tag will already be configured with the correct ID and priority bits
  */
 void
-ice_tx_prepare_vlan_flags_dcb(struct ice_ring *tx_ring,
+ice_tx_prepare_vlan_flags_dcb(struct ice_tx_ring *tx_ring,
 			      struct ice_tx_buf *first)
 {
 	struct sk_buff *skb = first->skb;

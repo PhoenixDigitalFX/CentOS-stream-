@@ -54,6 +54,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_split);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
+EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_insert);
 
 DEFINE_IDA(blk_queue_ida);
 
@@ -392,8 +393,10 @@ void blk_cleanup_queue(struct request_queue *q)
 	del_timer_sync(&q->backing_dev_info->laptop_mode_wb_timer);
 	blk_sync_queue(q);
 
-	if (queue_is_mq(q))
+	if (queue_is_mq(q)) {
+		blk_mq_cancel_work_sync(q);
 		blk_mq_exit_queue(q);
+	}
 
 	/*
 	 * In theory, request pool of sched_tags belongs to request queue.
@@ -955,8 +958,8 @@ static blk_qc_t do_make_request(struct bio *bio)
 	struct request_queue *q = bio->bi_disk->queue;
 	blk_qc_t ret = BLK_QC_T_NONE;
 
-	if (!q->make_request_fn)
-		return blk_mq_make_request(q, bio);
+	if (queue_is_mq(q))
+		return q->make_request_fn(q, bio);
 	ret = q->make_request_fn(q, bio);
 	blk_queue_exit(q);
 	return ret;
@@ -1065,7 +1068,7 @@ blk_qc_t direct_make_request(struct bio *bio)
 {
 	struct request_queue *q = bio->bi_disk->queue;
 
-	if (WARN_ON_ONCE(q->make_request_fn)) {
+	if (WARN_ON_ONCE(!queue_is_mq(q))) {
 		bio_io_error(bio);
 		return BLK_QC_T_NONE;
 	}
@@ -1073,7 +1076,7 @@ blk_qc_t direct_make_request(struct bio *bio)
 		return BLK_QC_T_NONE;
 	if (unlikely(bio_queue_enter(bio)))
 		return BLK_QC_T_NONE;
-	return blk_mq_make_request(q, bio);
+	return q->make_request_fn(q, bio);
 }
 EXPORT_SYMBOL_GPL(direct_make_request);
 
@@ -1387,26 +1390,22 @@ void blk_steal_bios(struct bio_list *list, struct request *rq)
 EXPORT_SYMBOL_GPL(blk_steal_bios);
 
 /**
- * blk_update_request - Special helper function for request stacking drivers
+ * blk_update_request - Complete multiple bytes without completing the request
  * @req:      the request being processed
  * @error:    block status code
- * @nr_bytes: number of bytes to complete @req
+ * @nr_bytes: number of bytes to complete for @req
  *
  * Description:
  *     Ends I/O on a number of bytes attached to @req, but doesn't complete
  *     the request structure even if @req doesn't have leftover.
  *     If @req has leftover, sets it up for the next range of segments.
  *
- *     This special helper function is only for request stacking drivers
- *     (e.g. request-based dm) so that they can handle partial completion.
- *     Actual device drivers should use blk_mq_end_request instead.
- *
  *     Passing the result of blk_rq_bytes() as @nr_bytes guarantees
  *     %false return from this function.
  *
  * Note:
- *	The RQF_SPECIAL_PAYLOAD flag is ignored on purpose in both
- *	blk_rq_bytes() and in blk_update_request().
+ *	The RQF_SPECIAL_PAYLOAD flag is ignored on purpose in this function
+ *      except in the consistency check at the end of this function.
  *
  * Return:
  *     %false - this request doesn't have any more data

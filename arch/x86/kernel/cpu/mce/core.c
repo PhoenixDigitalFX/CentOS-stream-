@@ -44,6 +44,7 @@
 #include <linux/jump_label.h>
 #include <linux/set_memory.h>
 #include <linux/sync_core.h>
+#include <linux/task_work.h>
 #include <linux/hardirq.h>
 
 #include <asm/intel-family.h>
@@ -1090,24 +1091,6 @@ static void mce_clear_state(unsigned long *toclear)
 	}
 }
 
-static int do_memory_failure(struct mce *m)
-{
-	int flags = MF_ACTION_REQUIRED;
-	int ret;
-
-	pr_err("Uncorrected hardware memory error in user-access at %llx", m->addr);
-
-	if (!current->task_struct_rh->mce_ripv)
-		flags |= MF_MUST_KILL;
-	ret = memory_failure(m->addr >> PAGE_SHIFT, flags);
-	if (ret)
-		pr_err("Memory error not recovered");
-	else
-		set_mce_nospec(m->addr >> PAGE_SHIFT, current->task_struct_rh->mce_whole_page);
-	return ret;
-}
-
-
 /*
  * Cases where we avoid rendezvous handler timeout:
  * 1) If this CPU is offline.
@@ -1203,6 +1186,67 @@ static void __mc_scan_banks(struct mce *m, struct mce *final,
 	*m = *final;
 }
 
+static void kill_me_now(struct callback_head *ch)
+{
+	struct task_struct_rh *p = container_of(ch, struct task_struct_rh, mce_kill_me);
+
+	p->mce_count = 0;
+	force_sig(SIGBUS, current);
+}
+
+static void kill_me_maybe(struct callback_head *cb)
+{
+	struct task_struct_rh *p = container_of(cb, struct task_struct_rh, mce_kill_me);
+	int flags = MF_ACTION_REQUIRED;
+
+	p->mce_count = 0;
+	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
+
+	if (!p->mce_ripv)
+		flags |= MF_MUST_KILL;
+
+	if (!memory_failure(p->mce_addr >> PAGE_SHIFT, flags)) {
+		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
+		sync_core();
+		return;
+	}
+
+	pr_err("Memory error not recovered");
+	kill_me_now(cb);
+}
+
+static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
+{
+	struct task_struct_rh *current_rh = current->task_struct_rh;
+	int count = ++current_rh->mce_count;
+
+	/* First call, save all the details */
+	if (count == 1) {
+		current_rh->mce_addr = m->addr;
+		current_rh->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
+		current_rh->mce_whole_page = whole_page(m);
+
+		if (kill_current_task)
+			current_rh->mce_kill_me.func = kill_me_now;
+		else
+			current_rh->mce_kill_me.func = kill_me_maybe;
+	}
+
+	/* Ten is likely overkill. Don't expect more than two faults before task_work() */
+	if (count > 10)
+		mce_panic("Too many consecutive machine checks while accessing user data", m, msg);
+
+	/* Second or later call, make sure page address matches the one from first call */
+	if (count > 1 && (current_rh->mce_addr >> PAGE_SHIFT) != (m->addr >> PAGE_SHIFT))
+		mce_panic("Consecutive machine checks to different user pages", m, msg);
+
+	/* Do not call task_work_add() more than once */
+	if (count > 1)
+		return;
+
+	task_work_add(current, &current_rh->mce_kill_me, true);
+}
+
 /*
  * The actual machine check handler. This only handles real
  * exceptions when something got corrupted coming in through int 18.
@@ -1215,7 +1259,7 @@ static void __mc_scan_banks(struct mce *m, struct mce *final,
  * MCE broadcast. However some CPUs might be broken beyond repair,
  * so be always careful when synchronizing with others.
  */
-void do_machine_check(struct pt_regs *regs, long error_code)
+void noinstr do_machine_check(struct pt_regs *regs, long error_code)
 {
 	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
 	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
@@ -1238,10 +1282,10 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	int no_way_out = 0;
 
 	/*
-	 * If kill_it gets set, there might be a way to recover from this
+	 * If kill_current_task is not set, there might be a way to recover from this
 	 * error.
 	 */
-	int kill_it = 0;
+	int kill_current_task = 0;
 
 	/*
 	 * MCEs are always local on AMD. Same is determined by MCG_STATUS_LMCES
@@ -1273,7 +1317,7 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	 * severity is MCE_AR_SEVERITY we have other options.
 	 */
 	if (!(m.mcgstatus & MCG_STATUS_RIPV))
-		kill_it = 1;
+		kill_current_task = 1;
 
 	/*
 	 * Check if this MCE is signaled to only this logical processor,
@@ -1328,39 +1372,30 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	 * processes and continue even when there is no way out.
 	 */
 	if (cfg->tolerant == 3)
-		kill_it = 0;
+		kill_current_task = 0;
 	else if (no_way_out)
 		mce_panic("Fatal machine check on current CPU", &m, msg);
 
 	if (worst > 0)
 		mce_report_event(regs);
-	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
 
-	sync_core();
-
-	if (worst != MCE_AR_SEVERITY && !kill_it)
-		goto out_ist;
+	if (worst != MCE_AR_SEVERITY && !kill_current_task)
+		goto out;
 
 	/* Fault was in user mode and we need to take some action */
 	if ((m.cs & 3) == 3) {
 		/* If this triggers there is no way to recover. Die hard. */
 		BUG_ON(!on_thread_stack() || !user_mode(regs));
-		local_irq_enable();
-		preempt_enable();
 
-		current->task_struct_rh->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
-		current->task_struct_rh->mce_whole_page = whole_page(&m);
+		queue_task_work(&m, msg, kill_current_task);
 
-		if (kill_it || do_memory_failure(&m))
-			force_sig(SIGBUS, current);
-		preempt_disable();
-		local_irq_disable();
 	} else {
 		if (!fixup_exception(regs, X86_TRAP_MC))
 			mce_panic("Failed kernel mode recovery", &m, NULL);
 	}
 
-out_ist:
+out:
+	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
 	nmi_exit();
 }
 EXPORT_SYMBOL_GPL(do_machine_check);
@@ -1494,6 +1529,11 @@ static void __mcheck_cpu_mce_banks_init(void)
 	for (i = 0; i < n_banks; i++) {
 		struct mce_bank *b = &mce_banks[i];
 
+		/*
+		 * Init them all, __mcheck_cpu_apply_quirks() is going to apply
+		 * the required vendor quirks before
+		 * __mcheck_cpu_init_clear_banks() does the final bank setup.
+		 */
 		b->ctl = -1ULL;
 		b->init = 1;
 	}
@@ -1563,6 +1603,33 @@ static void __mcheck_cpu_init_clear_banks(void)
 			continue;
 		wrmsrl(msr_ops.ctl(i), b->ctl);
 		wrmsrl(msr_ops.status(i), 0);
+	}
+}
+
+/*
+ * Do a final check to see if there are any unused/RAZ banks.
+ *
+ * This must be done after the banks have been initialized and any quirks have
+ * been applied.
+ *
+ * Do not call this from any user-initiated flows, e.g. CPU hotplug or sysfs.
+ * Otherwise, a user who disables a bank will not be able to re-enable it
+ * without a system reboot.
+ */
+static void __mcheck_cpu_check_banks(void)
+{
+	struct mce_bank *mce_banks = this_cpu_ptr(mce_banks_array);
+	u64 msrval;
+	int i;
+
+	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
+		struct mce_bank *b = &mce_banks[i];
+
+		if (!b->init)
+			continue;
+
+		rdmsrl(msr_ops.ctl(i), msrval);
+		b->init = !!msrval;
 	}
 }
 
@@ -1707,6 +1774,7 @@ static void __mcheck_cpu_init_early(struct cpuinfo_x86 *c)
 		mce_flags.overflow_recov = !!cpu_has(c, X86_FEATURE_OVERFLOW_RECOV);
 		mce_flags.succor	 = !!cpu_has(c, X86_FEATURE_SUCCOR);
 		mce_flags.smca		 = !!cpu_has(c, X86_FEATURE_SMCA);
+		mce_flags.amd_threshold	 = 1;
 
 		if (mce_flags.smca) {
 			msr_ops.ctl	= smca_ctl_reg;
@@ -1850,6 +1918,7 @@ void mcheck_cpu_init(struct cpuinfo_x86 *c)
 	__mcheck_cpu_init_generic();
 	__mcheck_cpu_init_vendor(c);
 	__mcheck_cpu_init_clear_banks();
+	__mcheck_cpu_check_banks();
 	__mcheck_cpu_setup_timer();
 }
 
@@ -2084,6 +2153,9 @@ static ssize_t show_bank(struct device *s, struct device_attribute *attr,
 
 	b = &per_cpu(mce_banks_array, s->id)[bank];
 
+	if (!b->init)
+		return -ENODEV;
+
 	return sprintf(buf, "%llx\n", b->ctl);
 }
 
@@ -2101,6 +2173,9 @@ static ssize_t set_bank(struct device *s, struct device_attribute *attr,
 		return -EINVAL;
 
 	b = &per_cpu(mce_banks_array, s->id)[bank];
+
+	if (!b->init)
+		return -ENODEV;
 
 	b->ctl = new;
 	mce_restart();
@@ -2377,6 +2452,13 @@ static __init void mce_init_banks(void)
 	}
 }
 
+/*
+ * When running on XEN, this initcall is ordered against the XEN mcelog
+ * initcall:
+ *
+ *   device_initcall(xen_late_init_mcelog);
+ *   device_initcall_sync(mcheck_init_device);
+ */
 static __init int mcheck_init_device(void)
 {
 	int err;
@@ -2408,6 +2490,10 @@ static __init int mcheck_init_device(void)
 	if (err)
 		goto err_out_mem;
 
+	/*
+	 * Invokes mce_cpu_online() on all CPUs which are online when
+	 * the state is installed.
+	 */
 	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "x86/mce:online",
 				mce_cpu_online, mce_cpu_pre_down);
 	if (err < 0)

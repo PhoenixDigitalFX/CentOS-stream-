@@ -519,7 +519,8 @@ static int __kvmppc_svm_page_out(struct vm_area_struct *vma,
 	mig.end = end;
 	mig.src = &src_pfn;
 	mig.dst = &dst_pfn;
-	mig.src_owner = &kvmppc_uvmem_pgmap;
+	mig.pgmap_owner = &kvmppc_uvmem_pgmap;
+	mig.flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
 
 	/* The requested page is already paged-out, nothing to do */
 	if (!kvmppc_gfn_is_uvmem_pfn(gpa >> page_shift, kvm, NULL))
@@ -613,7 +614,7 @@ void kvmppc_uvmem_drop_pages(const struct kvm_memory_slot *slot,
 
 		/* Fetch the VMA if addr is not in the latest fetched one */
 		if (!vma || addr >= vma->vm_end) {
-			vma = find_vma_intersection(kvm->mm, addr, addr+1);
+			vma = vma_lookup(kvm->mm, addr);
 			if (!vma) {
 				pr_err("Can't find VMA for gfn:0x%lx\n", gfn);
 				break;
@@ -744,6 +745,7 @@ static int kvmppc_svm_page_in(struct vm_area_struct *vma,
 	mig.end = end;
 	mig.src = &src_pfn;
 	mig.dst = &dst_pfn;
+	mig.flags = MIGRATE_VMA_SELECT_SYSTEM;
 
 	ret = migrate_vma_setup(&mig);
 	if (ret)
