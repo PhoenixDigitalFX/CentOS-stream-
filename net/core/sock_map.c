@@ -14,7 +14,7 @@
 #include <linux/sock_diag.h>
 #include <net/udp.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 struct bpf_stab {
 	struct bpf_map map;
@@ -50,7 +50,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 	bpf_map_init_from_attr(&stab->map, attr);
 	raw_spin_lock_init(&stab->lock);
 
-	stab->sks = bpf_map_area_alloc(stab->map.max_entries *
+	stab->sks = bpf_map_area_alloc((u64) stab->map.max_entries *
 				       sizeof(struct sock *),
 				       stab->map.numa_node);
 	if (!stab->sks) {
@@ -68,7 +68,7 @@ int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 	struct fd f;
 	int ret;
 
-	rh_mark_used_feature("eBPF/sockmap");
+	rh_add_flag("eBPF/sockmap");
 
 	if (attr->attach_flags || attr->replace_bpf_fd)
 		return -EINVAL;

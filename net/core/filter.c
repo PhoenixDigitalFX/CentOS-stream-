@@ -81,7 +81,7 @@
 #include <linux/btf_ids.h>
 #include <net/tls.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 static const struct bpf_func_proto *
 bpf_sk_base_func_proto(enum bpf_func_id func_id);
@@ -1582,7 +1582,7 @@ int sk_attach_bpf(u32 ufd, struct sock *sk)
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	rh_mark_used_feature("eBPF/sock");
+	rh_add_flag("eBPF/sock");
 
 	err = __sk_attach_prog(prog, sk);
 	if (err < 0) {
@@ -1607,7 +1607,7 @@ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk)
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	rh_mark_used_feature("eBPF/reuseport");
+	rh_add_flag("eBPF/reuseport");
 
 	if (prog->type == BPF_PROG_TYPE_SK_REUSEPORT) {
 		/* Like other non BPF_PROG_TYPE_SOCKET_FILTER
@@ -10189,6 +10189,8 @@ sk_reuseport_func_proto(enum bpf_func_id func_id,
 		return &sk_reuseport_load_bytes_proto;
 	case BPF_FUNC_skb_load_bytes_relative:
 		return &sk_reuseport_load_bytes_relative_proto;
+	case BPF_FUNC_get_socket_cookie:
+		return &bpf_get_socket_ptr_cookie_proto;
 	default:
 		return bpf_base_func_proto(func_id);
 	}
@@ -10217,6 +10219,10 @@ sk_reuseport_is_valid_access(int off, int size,
 
 	case offsetof(struct sk_reuseport_md, hash):
 		return size == size_default;
+
+	case offsetof(struct sk_reuseport_md, sk):
+		info->reg_type = PTR_TO_SOCKET;
+		return size == sizeof(__u64);
 
 	/* Fields that allow narrowing */
 	case bpf_ctx_range(struct sk_reuseport_md, eth_protocol):
@@ -10298,6 +10304,10 @@ static u32 sk_reuseport_convert_ctx_access(enum bpf_access_type type,
 
 	case offsetof(struct sk_reuseport_md, bind_inany):
 		SK_REUSEPORT_LOAD_FIELD(bind_inany);
+		break;
+
+	case offsetof(struct sk_reuseport_md, sk):
+		SK_REUSEPORT_LOAD_FIELD(sk);
 		break;
 	}
 

@@ -16,6 +16,10 @@ string-stream-test
 test_linear_ranges
 test_bits
 test_kasan
+fat_test
+test_list_sort
+slub_kunit
+memcpy_kunit
 locktorture
 mac80211_hwsim
 netdevsim

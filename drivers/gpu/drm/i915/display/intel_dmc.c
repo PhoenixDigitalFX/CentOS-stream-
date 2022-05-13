@@ -47,8 +47,8 @@
 
 #define GEN13_DMC_MAX_FW_SIZE		0x20000
 
-#define ADLP_DMC_PATH			DMC_PATH(adlp, 2, 12)
-#define ADLP_DMC_VERSION_REQUIRED	DMC_VERSION(2, 12)
+#define ADLP_DMC_PATH			DMC_PATH(adlp, 2, 14)
+#define ADLP_DMC_VERSION_REQUIRED	DMC_VERSION(2, 14)
 MODULE_FIRMWARE(ADLP_DMC_PATH);
 
 #define ADLS_DMC_PATH			DMC_PATH(adls, 2, 01)
@@ -637,7 +637,7 @@ static void parse_dmc_fw(struct drm_i915_private *dev_priv,
 			continue;
 
 		offset = readcount + dmc->dmc_info[id].dmc_offset * 4;
-		if (fw->size - offset < 0) {
+		if (offset > fw->size) {
 			drm_err(&dev_priv->drm, "Reading beyond the fw_size\n");
 			continue;
 		}
