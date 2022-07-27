@@ -1585,6 +1585,8 @@ static struct sk_buff *tcp_shift_skb_data(struct sock *sk, struct sk_buff *skb,
 	    (mss != tcp_skb_seglen(skb)))
 		goto out;
 
+	if (!tcp_skb_can_collapse(prev, skb))
+		goto out;
 	len = skb->len;
 	pcount = tcp_skb_pcount(skb);
 	if (tcp_skb_shift(prev, skb, pcount, len))
@@ -2259,8 +2261,7 @@ static bool tcp_time_to_recover(struct sock *sk, int flag)
 }
 
 /* Detect loss in event "A" above by marking head of queue up as lost.
- * For non-SACK(Reno) senders, the first "packets" number of segments
- * are considered lost. For RFC3517 SACK, a segment is considered lost if it
+ * For RFC3517 SACK, a segment is considered lost if it
  * has at least tp->reordering SACKed seqments above it; "packets" refers to
  * the maximum SACKed segments to pass before reaching this limit.
  */
@@ -2268,10 +2269,9 @@ static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
-	int cnt, oldcnt, lost;
-	unsigned int mss;
+	int cnt;
 	/* Use SACK to deduce losses of new sequences sent during recovery */
-	const u32 loss_high = tcp_is_sack(tp) ?  tp->snd_nxt : tp->high_seq;
+	const u32 loss_high = tp->snd_nxt;
 
 	WARN_ON(packets > tp->packets_out);
 	skb = tp->lost_skb_hint;
@@ -2294,26 +2294,11 @@ static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
 		if (after(TCP_SKB_CB(skb)->end_seq, loss_high))
 			break;
 
-		oldcnt = cnt;
-		if (tcp_is_reno(tp) ||
-		    (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED))
+		if (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED)
 			cnt += tcp_skb_pcount(skb);
 
-		if (cnt > packets) {
-			if (tcp_is_sack(tp) ||
-			    (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED) ||
-			    (oldcnt >= packets))
-				break;
-
-			mss = tcp_skb_mss(skb);
-			/* If needed, chop off the prefix to mark as lost. */
-			lost = (packets - oldcnt) * mss;
-			if (lost < skb->len &&
-			    tcp_fragment(sk, TCP_FRAG_IN_RTX_QUEUE, skb,
-					 lost, mss, GFP_ATOMIC) < 0)
-				break;
-			cnt = packets;
-		}
+		if (cnt > packets)
+			break;
 
 		tcp_skb_mark_lost(tp, skb);
 
@@ -2796,8 +2781,17 @@ static void tcp_process_loss(struct sock *sk, int flag, int num_dupack,
 	*rexmit = REXMIT_LOST;
 }
 
+static bool tcp_force_fast_retransmit(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	return after(tcp_highest_sack_seq(tp),
+		     tp->snd_una + tp->reordering * tp->mss_cache);
+}
+
 /* Undo during fast recovery after partial ACK. */
-static bool tcp_try_undo_partial(struct sock *sk, u32 prior_snd_una)
+static bool tcp_try_undo_partial(struct sock *sk, u32 prior_snd_una,
+				 bool *do_lost)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -2822,7 +2816,9 @@ static bool tcp_try_undo_partial(struct sock *sk, u32 prior_snd_una)
 		tcp_undo_cwnd_reduction(sk, true);
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPPARTIALUNDO);
 		tcp_try_keep_open(sk);
-		return true;
+	} else {
+		/* Partial ACK arrived. Force fast retransmit. */
+		*do_lost = tcp_force_fast_retransmit(sk);
 	}
 	return false;
 }
@@ -2844,14 +2840,6 @@ static void tcp_identify_packet_loss(struct sock *sk, int *ack_flag)
 		if (prior_retrans > tp->retrans_out)
 			*ack_flag |= FLAG_LOST_RETRANS;
 	}
-}
-
-static bool tcp_force_fast_retransmit(struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-
-	return after(tcp_highest_sack_seq(tp),
-		     tp->snd_una + tp->reordering * tp->mss_cache);
 }
 
 /* Process an event, which can update packets-in-flight not trivially.
@@ -2922,18 +2910,21 @@ static void tcp_fastretrans_alert(struct sock *sk, const u32 prior_snd_una,
 		if (!(flag & FLAG_SND_UNA_ADVANCED)) {
 			if (tcp_is_reno(tp))
 				tcp_add_reno_sack(sk, num_dupack);
-		} else {
-			if (tcp_try_undo_partial(sk, prior_snd_una))
-				return;
-			/* Partial ACK arrived. Force fast retransmit. */
-			do_lost = tcp_is_reno(tp) ||
-				  tcp_force_fast_retransmit(sk);
-		}
-		if (tcp_try_undo_dsack(sk)) {
-			tcp_try_keep_open(sk);
+		} else if (tcp_try_undo_partial(sk, prior_snd_una, &do_lost))
 			return;
-		}
+
+		if (tcp_try_undo_dsack(sk))
+			tcp_try_keep_open(sk);
+
 		tcp_identify_packet_loss(sk, ack_flag);
+		if (icsk->icsk_ca_state != TCP_CA_Recovery) {
+			if (!tcp_time_to_recover(sk, flag))
+				return;
+			/* Undo reverts the recovery state. If loss is evident,
+			 * starts a new recovery (e.g. reordering then loss);
+			 */
+			tcp_enter_recovery(sk, flag & FLAG_ECE);
+		}
 		break;
 	case TCP_CA_Loss:
 		tcp_process_loss(sk, flag, num_dupack, rexmit);
@@ -4824,8 +4815,10 @@ int tcp_send_rcvq(struct sock *sk, struct msghdr *msg, size_t size)
 	skb->data_len = data_len;
 	skb->len = size;
 
-	if (tcp_try_rmem_schedule(sk, skb, skb->truesize))
+	if (tcp_try_rmem_schedule(sk, skb, skb->truesize)) {
+		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPRCVQDROP);
 		goto err_free;
+	}
 
 	err = skb_copy_datagram_from_iter(skb, 0, &msg->msg_iter, size);
 	if (err)
@@ -4891,14 +4884,17 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	 *  Out of sequence packets to the out_of_order_queue.
 	 */
 	if (TCP_SKB_CB(skb)->seq == tp->rcv_nxt) {
-		if (tcp_receive_window(tp) == 0)
+		if (tcp_receive_window(tp) == 0) {
+			NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPZEROWINDOWDROP);
 			goto out_of_window;
+		}
 
 		/* Ok. In sequence. In window. */
 queue_and_out:
 		if (skb_queue_len(&sk->sk_receive_queue) == 0)
 			sk_forced_mem_schedule(sk, skb->truesize);
 		else if (tcp_try_rmem_schedule(sk, skb, skb->truesize)) {
+			NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPRCVQDROP);
 			sk->sk_data_ready(sk);
 			goto drop;
 		}
@@ -4960,8 +4956,10 @@ drop:
 		/* If window is closed, drop tail of packet. But after
 		 * remembering D-SACK for its head made in previous line.
 		 */
-		if (!tcp_receive_window(tp))
+		if (!tcp_receive_window(tp)) {
+			NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPZEROWINDOWDROP);
 			goto out_of_window;
+		}
 		goto queue_and_out;
 	}
 
@@ -5312,7 +5310,17 @@ static void tcp_new_space(struct sock *sk)
 	sk->sk_write_space(sk);
 }
 
-static void tcp_check_space(struct sock *sk)
+/* Caller made space either from:
+ * 1) Freeing skbs in rtx queues (after tp->snd_una has advanced)
+ * 2) Sent skbs from output queue (and thus advancing tp->snd_nxt)
+ *
+ * We might be able to generate EPOLLOUT to the application if:
+ * 1) Space consumed in output/rtx queues is below sk->sk_sndbuf/2
+ * 2) notsent amount (tp->write_seq - tp->snd_nxt) became
+ *    small enough that tcp_stream_memory_free() decides it
+ *    is time to generate EPOLLOUT.
+ */
+void tcp_check_space(struct sock *sk)
 {
 	/* pairs with tcp_poll() */
 	smp_mb();
@@ -5665,7 +5673,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 	trace_tcp_probe(sk, skb);
 
 	tcp_mstamp_refresh(tp);
-	if (unlikely(!sk->sk_rx_dst))
+	if (unlikely(!rcu_access_pointer(sk->sk_rx_dst)))
 		inet_csk(sk)->icsk_af_ops->sk_rx_dst_set(sk, skb);
 	/*
 	 *	Header prediction.
@@ -6530,7 +6538,8 @@ static void tcp_openreq_init(struct request_sock *req,
 	ireq->ir_num = ntohs(tcp_hdr(skb)->dest);
 	ireq->ir_mark = inet_request_mark(sk, skb);
 #if IS_ENABLED(CONFIG_SMC)
-	ireq->smc_ok = rx_opt->smc_ok;
+	ireq->smc_ok = rx_opt->smc_ok && !(tcp_sk(sk)->smc_hs_congested &&
+			tcp_sk(sk)->smc_hs_congested(sk));
 #endif
 }
 

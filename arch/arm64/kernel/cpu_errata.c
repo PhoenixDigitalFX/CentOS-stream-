@@ -145,8 +145,8 @@ static void install_bp_hardening_cb(bp_hardening_cb_t fn,
 	int cpu, slot = -1;
 
 	/*
-	 * enable_smccc_arch_workaround_1() passes NULL for the hyp_vecs
-	 * start/end if we're a guest. Skip the hyp-vectors work.
+	 * detect_harden_bp_fw() passes NULL for the hyp_vecs start/end if
+	 * we're a guest. Skip the hyp-vectors work.
 	 */
 	if (!hyp_vecs_start) {
 		__this_cpu_write(bp_hardening_data.fn, fn);
@@ -265,9 +265,7 @@ static int detect_harden_bp_fw(void)
 	    ((midr & MIDR_CPU_MODEL_MASK) == MIDR_QCOM_FALKOR_V1))
 		cb = qcom_link_stack_sanitization;
 
-	if (IS_ENABLED(CONFIG_HARDEN_BRANCH_PREDICTOR))
-		install_bp_hardening_cb(cb, smccc_start, smccc_end);
-
+	install_bp_hardening_cb(cb, smccc_start, smccc_end);
 	return 1;
 }
 
@@ -345,11 +343,6 @@ void __init arm64_enable_wa2_handling(struct alt_instr *alt,
 void arm64_set_ssbd_mitigation(bool state)
 {
 	int conduit;
-
-	if (!IS_ENABLED(CONFIG_ARM64_SSBD)) {
-		pr_info_once("SSBD disabled by kernel configuration\n");
-		return;
-	}
 
 	if (this_cpu_has_cap(ARM64_SSBS)) {
 		if (state)
@@ -468,11 +461,20 @@ out_printmsg:
 	return required;
 }
 
+static void cpu_enable_ssbd_mitigation(const struct arm64_cpu_capabilities *cap)
+{
+	if (ssbd_state != ARM64_SSBD_FORCE_DISABLE)
+		cap->matches(cap, SCOPE_LOCAL_CPU);
+}
+
 /* known invulnerable cores */
 static const struct midr_range arm64_ssb_cpus[] = {
 	MIDR_ALL_VERSIONS(MIDR_CORTEX_A35),
 	MIDR_ALL_VERSIONS(MIDR_CORTEX_A53),
 	MIDR_ALL_VERSIONS(MIDR_CORTEX_A55),
+	MIDR_ALL_VERSIONS(MIDR_BRAHMA_B53),
+	MIDR_ALL_VERSIONS(MIDR_QCOM_KRYO_3XX_SILVER),
+	MIDR_ALL_VERSIONS(MIDR_QCOM_KRYO_4XX_SILVER),
 	{},
 };
 
@@ -483,12 +485,7 @@ static bool
 has_cortex_a76_erratum_1463225(const struct arm64_cpu_capabilities *entry,
 			       int scope)
 {
-	u32 midr = read_cpuid_id();
-	/* Cortex-A76 r0p0 - r3p1 */
-	struct midr_range range = MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 3, 1);
-
-	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
-	return is_midr_in_range(midr, &range) && is_kernel_in_hyp_mode();
+	return is_affected_midr_range_list(entry, scope) && is_kernel_in_hyp_mode();
 }
 #endif
 
@@ -557,6 +554,10 @@ static const struct midr_range spectre_v2_safe_list[] = {
 	MIDR_ALL_VERSIONS(MIDR_CORTEX_A35),
 	MIDR_ALL_VERSIONS(MIDR_CORTEX_A53),
 	MIDR_ALL_VERSIONS(MIDR_CORTEX_A55),
+	MIDR_ALL_VERSIONS(MIDR_BRAHMA_B53),
+	MIDR_ALL_VERSIONS(MIDR_HISI_TSV110),
+	MIDR_ALL_VERSIONS(MIDR_QCOM_KRYO_3XX_SILVER),
+	MIDR_ALL_VERSIONS(MIDR_QCOM_KRYO_4XX_SILVER),
 	{ /* sentinel */ }
 };
 
@@ -587,12 +588,6 @@ check_branch_predictor(const struct arm64_cpu_capabilities *entry, int scope)
 
 	__spectrev2_safe = false;
 
-	if (!IS_ENABLED(CONFIG_HARDEN_BRANCH_PREDICTOR)) {
-		pr_warn_once("spectrev2 mitigation disabled by kernel configuration\n");
-		__hardenbp_enab = false;
-		return false;
-	}
-
 	/* forced off */
 	if (__nospectre_v2 || cpu_mitigations_off()) {
 		pr_info_once("spectrev2 mitigation disabled by command line option\n");
@@ -606,6 +601,12 @@ check_branch_predictor(const struct arm64_cpu_capabilities *entry, int scope)
 	}
 
 	return (need_wa > 0);
+}
+
+static void
+cpu_enable_branch_predictor_hardening(const struct arm64_cpu_capabilities *cap)
+{
+	cap->matches(cap, SCOPE_LOCAL_CPU);
 }
 
 static const __maybe_unused struct midr_range tx2_family_cpus[] = {
@@ -655,17 +656,23 @@ static const struct midr_range ca57_a72[] = {
 #endif
 
 #ifdef CONFIG_ARM64_WORKAROUND_REPEAT_TLBI
-
-static const struct midr_range arm64_repeat_tlbi_cpus[] = {
+static const struct arm64_cpu_capabilities arm64_repeat_tlbi_list[] = {
 #ifdef CONFIG_QCOM_FALKOR_ERRATUM_1009
-	MIDR_RANGE(MIDR_QCOM_FALKOR_V1, 0, 0, 0, 0),
+	{
+		ERRATA_MIDR_REV(MIDR_QCOM_FALKOR_V1, 0, 0)
+	},
+	{
+		.midr_range.model = MIDR_QCOM_KRYO,
+		.matches = is_kryo_midr,
+	},
 #endif
 #ifdef CONFIG_ARM64_ERRATUM_1286807
-	MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 3, 0),
+	{
+		ERRATA_MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 3, 0),
+	},
 #endif
 	{},
 };
-
 #endif
 
 #ifdef CONFIG_CAVIUM_ERRATUM_27456
@@ -729,6 +736,37 @@ static const struct midr_range erratum_1418040_list[] = {
 	MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 3, 1),
 	/* Neoverse-N1 r0p0 to r3p1 */
 	MIDR_RANGE(MIDR_NEOVERSE_N1, 0, 0, 3, 1),
+	/* Kryo4xx Gold (rcpe to rfpf) => (r0p0 to r3p1) */
+	MIDR_RANGE(MIDR_QCOM_KRYO_4XX_GOLD, 0xc, 0xe, 0xf, 0xf),
+	{},
+};
+#endif
+
+#ifdef CONFIG_ARM64_ERRATUM_845719
+static const struct midr_range erratum_845719_list[] = {
+	/* Cortex-A53 r0p[01234] */
+	MIDR_REV_RANGE(MIDR_CORTEX_A53, 0, 0, 4),
+	/* Brahma-B53 r0p[0] */
+	MIDR_REV(MIDR_BRAHMA_B53, 0, 0),
+	/* Kryo2XX Silver rAp4 */
+	MIDR_REV(MIDR_QCOM_KRYO_2XX_SILVER, 0xa, 0x4),
+	{},
+};
+#endif
+
+#ifdef CONFIG_ARM64_ERRATUM_843419
+static const struct arm64_cpu_capabilities erratum_843419_list[] = {
+	{
+		/* Cortex-A53 r0p[01234] */
+		.matches = is_affected_midr_range,
+		ERRATA_MIDR_REV_RANGE(MIDR_CORTEX_A53, 0, 0, 4),
+		MIDR_FIXED(0x4, BIT(8)),
+	},
+	{
+		/* Brahma-B53 r0p[0] */
+		.matches = is_affected_midr_range,
+		ERRATA_MIDR_REV(MIDR_BRAHMA_B53, 0, 0),
+	},
 	{},
 };
 #endif
@@ -746,7 +784,19 @@ static const struct midr_range erratum_speculative_at_list[] = {
 #ifdef CONFIG_ARM64_ERRATUM_1530923
 	/* Cortex A55 r0p0 to r2p0 */
 	MIDR_RANGE(MIDR_CORTEX_A55, 0, 0, 2, 0),
+	/* Kryo4xx Silver (rdpe => r1p0) */
+	MIDR_REV(MIDR_QCOM_KRYO_4XX_SILVER, 0xd, 0xe),
 #endif
+	{},
+};
+#endif
+
+#ifdef CONFIG_ARM64_ERRATUM_1463225
+static const struct midr_range erratum_1463225[] = {
+	/* Cortex-A76 r0p0 - r3p1 */
+	MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 3, 1),
+	/* Kryo4xx Gold (rcpe to rfpf) => (r0p0 to r3p1) */
+	MIDR_RANGE(MIDR_QCOM_KRYO_4XX_GOLD, 0xc, 0xe, 0xf, 0xf),
 	{},
 };
 #endif
@@ -754,7 +804,7 @@ static const struct midr_range erratum_speculative_at_list[] = {
 const struct arm64_cpu_capabilities arm64_errata[] = {
 #ifdef CONFIG_ARM64_WORKAROUND_CLEAN_CACHE
 	{
-		.desc = "ARM errata 826319, 827319, 824069, 819472",
+		.desc = "ARM errata 826319, 827319, 824069, or 819472",
 		.capability = ARM64_WORKAROUND_CLEAN_CACHE,
 		ERRATA_MIDR_RANGE_LIST(workaround_clean_cache),
 		.cpu_enable = cpu_enable_cache_maint_trap,
@@ -782,19 +832,18 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 #endif
 #ifdef CONFIG_ARM64_ERRATUM_843419
 	{
-	/* Cortex-A53 r0p[01234] */
 		.desc = "ARM erratum 843419",
 		.capability = ARM64_WORKAROUND_843419,
-		ERRATA_MIDR_REV_RANGE(MIDR_CORTEX_A53, 0, 0, 4),
-		MIDR_FIXED(0x4, BIT(8)),
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+		.matches = cpucap_multi_entry_cap_matches,
+		.match_list = erratum_843419_list,
 	},
 #endif
 #ifdef CONFIG_ARM64_ERRATUM_845719
 	{
-	/* Cortex-A53 r0p[01234] */
 		.desc = "ARM erratum 845719",
 		.capability = ARM64_WORKAROUND_845719,
-		ERRATA_MIDR_REV_RANGE(MIDR_CORTEX_A53, 0, 0, 4),
+		ERRATA_MIDR_RANGE_LIST(erratum_845719_list),
 	},
 #endif
 #ifdef CONFIG_CAVIUM_ERRATUM_23154
@@ -830,15 +879,18 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 	{
 		.desc = "Qualcomm Technologies Falkor/Kryo erratum 1003",
 		.capability = ARM64_WORKAROUND_QCOM_FALKOR_E1003,
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
 		.matches = cpucap_multi_entry_cap_matches,
 		.match_list = qcom_erratum_1003_list,
 	},
 #endif
 #ifdef CONFIG_ARM64_WORKAROUND_REPEAT_TLBI
 	{
-		.desc = "Qualcomm erratum 1009, ARM erratum 1286807",
+		.desc = "Qualcomm erratum 1009, or ARM erratum 1286807",
 		.capability = ARM64_WORKAROUND_REPEAT_TLBI,
-		ERRATA_MIDR_RANGE_LIST(arm64_repeat_tlbi_cpus),
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+		.matches = cpucap_multi_entry_cap_matches,
+		.match_list = arm64_repeat_tlbi_list,
 	},
 #endif
 #ifdef CONFIG_ARM64_ERRATUM_858921
@@ -850,9 +902,11 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 	},
 #endif
 	{
+		.desc = "Branch predictor hardening",
 		.capability = ARM64_HARDEN_BRANCH_PREDICTOR,
 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
 		.matches = check_branch_predictor,
+		.cpu_enable = cpu_enable_branch_predictor_hardening,
 	},
 #ifdef CONFIG_HARDEN_EL2_VECTORS
 	{
@@ -866,6 +920,7 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		.capability = ARM64_SSBD,
 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
 		.matches = has_ssbd_mitigation,
+		.cpu_enable = cpu_enable_ssbd_mitigation,
 		.midr_range_list = arm64_ssb_cpus,
 	},
 #ifdef CONFIG_ARM64_ERRATUM_1418040
@@ -873,13 +928,28 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		.desc = "ARM erratum 1418040",
 		.capability = ARM64_WORKAROUND_1418040,
 		ERRATA_MIDR_RANGE_LIST(erratum_1418040_list),
+		/*
+		 * We need to allow affected CPUs to come in late, but
+		 * also need the non-affected CPUs to be able to come
+		 * in at any point in time. Wonderful.
+		 */
+		.type = ARM64_CPUCAP_WEAK_LOCAL_CPU_FEATURE,
 	},
 #endif
 #ifdef CONFIG_ARM64_WORKAROUND_SPECULATIVE_AT
 	{
-		.desc = "ARM errata 1165522, 1319367, 1530923",
+		.desc = "ARM errata 1165522, 1319367 or 1530923",
 		.capability = ARM64_WORKAROUND_SPECULATIVE_AT,
 		ERRATA_MIDR_RANGE_LIST(erratum_speculative_at_list),
+	},
+#endif
+#ifdef CONFIG_ARM64_ERRATUM_1463225
+	{
+		.desc = "ARM erratum 1463225",
+		.capability = ARM64_WORKAROUND_1463225,
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+		.matches = has_cortex_a76_erratum_1463225,
+		.midr_range_list = erratum_1463225,
 	},
 #endif
 #ifdef CONFIG_CAVIUM_TX2_ERRATUM_219
@@ -895,14 +965,6 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		ERRATA_MIDR_RANGE_LIST(tx2_family_cpus),
 	},
 #endif
-#ifdef CONFIG_ARM64_ERRATUM_1463225
-	{
-		.desc = "ARM erratum 1463225",
-		.capability = ARM64_WORKAROUND_1463225,
-		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
-		.matches = has_cortex_a76_erratum_1463225,
-	},
-#endif
 #ifdef CONFIG_ARM64_ERRATUM_1542419
 	{
 		/* we depend on the firmware portion for correctness */
@@ -911,6 +973,16 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
 		.matches = has_neoverse_n1_erratum_1542419,
 		.cpu_enable = cpu_enable_trap_ctr_access,
+	},
+#endif
+#ifdef CONFIG_ARM64_ERRATUM_1508412
+	{
+		/* we depend on the firmware portion for correctness */
+		.desc = "ARM erratum 1508412 (kernel portion)",
+		.capability = ARM64_WORKAROUND_1508412,
+		ERRATA_MIDR_RANGE(MIDR_CORTEX_A77,
+				  0, 0,
+				  1, 0),
 	},
 #endif
 #ifdef CONFIG_NVIDIA_CARMEL_CNP_ERRATUM
@@ -954,9 +1026,7 @@ ssize_t cpu_show_spec_store_bypass(struct device *dev,
 	switch (ssbd_state) {
 	case ARM64_SSBD_KERNEL:
 	case ARM64_SSBD_FORCE_ENABLE:
-		if (IS_ENABLED(CONFIG_ARM64_SSBD))
-			return sprintf(buf,
-			    "Mitigation: Speculative Store Bypass disabled via prctl\n");
+		return sprintf(buf, "Mitigation: Speculative Store Bypass disabled via prctl\n");
 	}
 
 	return sprintf(buf, "Vulnerable\n");

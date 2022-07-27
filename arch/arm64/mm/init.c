@@ -136,33 +136,8 @@ static void __init reserve_crashkernel(void)
 	crashk_res.start = crash_base;
 	crashk_res.end = crash_base + crash_size - 1;
 }
-
-static void __init kexec_reserve_crashkres_pages(void)
-{
-#ifdef CONFIG_HIBERNATION
-	phys_addr_t addr;
-	struct page *page;
-
-	if (!crashk_res.end)
-		return;
-
-	/*
-	 * To reduce the size of hibernation image, all the pages are
-	 * marked as Reserved initially.
-	 */
-	for (addr = crashk_res.start; addr < (crashk_res.end + 1);
-			addr += PAGE_SIZE) {
-		page = phys_to_page(addr);
-		SetPageReserved(page);
-	}
-#endif
-}
 #else
 static void __init reserve_crashkernel(void)
-{
-}
-
-static void __init kexec_reserve_crashkres_pages(void)
 {
 }
 #endif /* CONFIG_KEXEC_CORE */
@@ -240,7 +215,6 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 	free_area_init(max_zone_pfns);
 }
 
-#ifdef CONFIG_HAVE_ARCH_PFN_VALID
 int pfn_valid(unsigned long pfn)
 {
 	phys_addr_t addr = pfn << PAGE_SHIFT;
@@ -252,13 +226,12 @@ int pfn_valid(unsigned long pfn)
 	if (pfn_to_section_nr(pfn) >= NR_MEM_SECTIONS)
 		return 0;
 
-	if (!valid_section(__nr_to_section(pfn_to_section_nr(pfn))))
+	if (!valid_section(__pfn_to_section(pfn)))
 		return 0;
 #endif
 	return memblock_is_map_memory(addr);
 }
 EXPORT_SYMBOL(pfn_valid);
-#endif
 
 #ifndef CONFIG_SPARSEMEM
 static void __init arm64_memory_present(void)
@@ -431,7 +404,7 @@ void __init arm64_memblock_init(void)
 		 * memory spans, randomize the linear region as well.
 		 */
 		if (memstart_offset_seed > 0 && range >= ARM64_MEMSTART_ALIGN) {
-			range = range / ARM64_MEMSTART_ALIGN + 1;
+			range /= ARM64_MEMSTART_ALIGN;
 			memstart_addr -= ARM64_MEMSTART_ALIGN *
 					 ((range * memstart_offset_seed) >> 16);
 		}
@@ -479,6 +452,7 @@ void __init bootmem_init(void)
 	early_memtest(min << PAGE_SHIFT, max << PAGE_SHIFT);
 
 	max_pfn = max_low_pfn = max;
+	min_low_pfn = min;
 
 	arch_numa_init();
 	/*
@@ -576,15 +550,13 @@ void __init mem_init(void)
 	else
 		swiotlb_force = SWIOTLB_NO_FORCE;
 
-	set_max_mapnr(pfn_to_page(max_pfn) - mem_map);
+	set_max_mapnr(max_pfn - PHYS_PFN_OFFSET);
 
 #ifndef CONFIG_SPARSEMEM_VMEMMAP
 	free_unused_memmap();
 #endif
 	/* this will put all unused low memory onto the freelists */
 	memblock_free_all();
-
-	kexec_reserve_crashkres_pages();
 
 	mem_init_print_info(NULL);
 
@@ -633,9 +605,14 @@ static int keep_initrd __initdata;
 
 void __init free_initrd_mem(unsigned long start, unsigned long end)
 {
+	unsigned long aligned_start, aligned_end;
+
 	if (!keep_initrd) {
+		aligned_start = __virt_to_phys(start) & PAGE_MASK;
+		aligned_end = PAGE_ALIGN(__virt_to_phys(end));
+
+		memblock_free(aligned_start, aligned_end - aligned_start);
 		free_reserved_area((void *)start, (void *)end, 0, "initrd");
-		memblock_free(__virt_to_phys(start), end - start);
 	}
 }
 

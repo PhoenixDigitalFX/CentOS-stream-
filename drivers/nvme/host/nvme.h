@@ -48,11 +48,6 @@ extern struct workqueue_struct *nvme_wq;
 extern struct workqueue_struct *nvme_reset_wq;
 extern struct workqueue_struct *nvme_delete_wq;
 
-enum {
-	NVME_NS_LBA		= 0,
-	NVME_NS_LIGHTNVM	= 1,
-};
-
 /*
  * List of workarounds for devices that required behavior not specified in
  * the standard.
@@ -353,6 +348,7 @@ struct nvme_ctrl {
 	int nr_reconnects;
 	unsigned long flags;
 #define NVME_CTRL_FAILFAST_EXPIRED	0
+#define NVME_CTRL_ADMIN_Q_STOPPED	1
 	struct nvmf_ctrl_options *opts;
 
 	struct page *discard_page;
@@ -477,6 +473,8 @@ struct nvme_ns {
 #define NVME_NS_DEAD     	1
 #define NVME_NS_ANA_PENDING	2
 #define NVME_NS_FORCE_RO	3
+#define NVME_NS_READY		4
+#define NVME_NS_STOPPED		5
 
 	struct cdev		cdev;
 	struct device		cdev_device;
@@ -677,6 +675,8 @@ void nvme_complete_async_event(struct nvme_ctrl *ctrl, __le16 status,
 
 void nvme_stop_queues(struct nvme_ctrl *ctrl);
 void nvme_start_queues(struct nvme_ctrl *ctrl);
+void nvme_stop_admin_queue(struct nvme_ctrl *ctrl);
+void nvme_start_admin_queue(struct nvme_ctrl *ctrl);
 void nvme_kill_queues(struct nvme_ctrl *ctrl);
 void nvme_sync_queues(struct nvme_ctrl *ctrl);
 void nvme_sync_io_queues(struct nvme_ctrl *ctrl);
@@ -702,7 +702,7 @@ static inline bool nvme_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
 		return true;
 	if (ctrl->ops->flags & NVME_F_FABRICS &&
 	    ctrl->state == NVME_CTRL_DELETING)
-		return true;
+		return queue_live;
 	return __nvme_check_ready(ctrl, rq, queue_live);
 }
 int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
@@ -765,9 +765,11 @@ void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id);
 void nvme_mpath_remove_disk(struct nvme_ns_head *head);
 int nvme_mpath_init_identify(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id);
 void nvme_mpath_init_ctrl(struct nvme_ctrl *ctrl);
+void nvme_mpath_update(struct nvme_ctrl *ctrl);
 void nvme_mpath_uninit(struct nvme_ctrl *ctrl);
 void nvme_mpath_stop(struct nvme_ctrl *ctrl);
 bool nvme_mpath_clear_current_path(struct nvme_ns *ns);
+void nvme_mpath_revalidate_paths(struct nvme_ns *ns);
 void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl);
 void nvme_mpath_shutdown_disk(struct nvme_ns_head *head);
 
@@ -818,6 +820,9 @@ static inline bool nvme_mpath_clear_current_path(struct nvme_ns *ns)
 {
 	return false;
 }
+static inline void nvme_mpath_revalidate_paths(struct nvme_ns *ns)
+{
+}
 static inline void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl)
 {
 }
@@ -837,6 +842,9 @@ static inline int nvme_mpath_init_identify(struct nvme_ctrl *ctrl,
 		dev_warn(ctrl->device,
 "Please enable CONFIG_NVME_MULTIPATH for full support of multi-port devices.\n");
 	return 0;
+}
+static inline void nvme_mpath_update(struct nvme_ctrl *ctrl)
+{
 }
 static inline void nvme_mpath_uninit(struct nvme_ctrl *ctrl)
 {
@@ -934,5 +942,24 @@ static inline bool nvme_multi_css(struct nvme_ctrl *ctrl)
 {
 	return (ctrl->ctrl_config & NVME_CC_CSS_MASK) == NVME_CC_CSS_CSI;
 }
+
+#ifdef CONFIG_NVME_VERBOSE_ERRORS
+const unsigned char *nvme_get_error_status_str(u16 status);
+const unsigned char *nvme_get_opcode_str(u8 opcode);
+const unsigned char *nvme_get_admin_opcode_str(u8 opcode);
+#else /* CONFIG_NVME_VERBOSE_ERRORS */
+static inline const unsigned char *nvme_get_error_status_str(u16 status)
+{
+	return "I/O Error";
+}
+static inline const unsigned char *nvme_get_opcode_str(u8 opcode)
+{
+	return "I/O Cmd";
+}
+static inline const unsigned char *nvme_get_admin_opcode_str(u8 opcode)
+{
+	return "Admin Cmd";
+}
+#endif /* CONFIG_NVME_VERBOSE_ERRORS */
 
 #endif /* _NVME_H */

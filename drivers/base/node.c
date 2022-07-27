@@ -236,7 +236,7 @@ static ssize_t name##_show(struct device *dev,				\
 	return sysfs_emit(buf, fmt "\n",				\
 			  to_cache_info(dev)->cache_attrs.name);	\
 }									\
-DEVICE_ATTR_RO(name);
+static DEVICE_ATTR_RO(name);
 
 CACHE_ATTR(size, "%llu")
 CACHE_ATTR(line_size, "%u")
@@ -580,6 +580,9 @@ static const struct attribute_group node_dev_group = {
 
 static const struct attribute_group *node_dev_groups[] = {
 	&node_dev_group,
+#ifdef CONFIG_HAVE_ARCH_NODE_DEV_GROUP
+	&arch_node_dev_group,
+#endif
 	NULL
 };
 
@@ -1054,7 +1057,7 @@ static struct attribute *node_state_attrs[] = {
 	NULL
 };
 
-static struct attribute_group memory_root_attr_group = {
+static const struct attribute_group memory_root_attr_group = {
 	.attrs = node_state_attrs,
 };
 

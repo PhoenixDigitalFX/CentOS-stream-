@@ -51,6 +51,7 @@ static LIST_HEAD(deferred_sync);
 static unsigned int defer_sync_state_count = 1;
 static DEFINE_MUTEX(fwnode_link_lock);
 static bool fw_devlink_is_permissive(void);
+static bool fw_devlink_drv_reg_done;
 
 /**
  * fwnode_link_add - Create a link between two fwnode_handles.
@@ -540,8 +541,10 @@ static void devlink_remove_symlinks(struct device *dev,
 		return;
 	}
 
-	snprintf(buf, len, "supplier:%s:%s", dev_bus_name(sup), dev_name(sup));
-	sysfs_remove_link(&con->kobj, buf);
+	if (device_is_registered(con)) {
+		snprintf(buf, len, "supplier:%s:%s", dev_bus_name(sup), dev_name(sup));
+		sysfs_remove_link(&con->kobj, buf);
+	}
 	snprintf(buf, len, "consumer:%s:%s", dev_bus_name(con), dev_name(con));
 	sysfs_remove_link(&sup->kobj, buf);
 	kfree(buf);
@@ -1143,6 +1146,41 @@ static ssize_t waiting_for_supplier_show(struct device *dev,
 static DEVICE_ATTR_RO(waiting_for_supplier);
 
 /**
+ * device_links_force_bind - Prepares device to be force bound
+ * @dev: Consumer device.
+ *
+ * device_bind_driver() force binds a device to a driver without calling any
+ * driver probe functions. So the consumer really isn't going to wait for any
+ * supplier before it's bound to the driver. We still want the device link
+ * states to be sensible when this happens.
+ *
+ * In preparation for device_bind_driver(), this function goes through each
+ * supplier device links and checks if the supplier is bound. If it is, then
+ * the device link status is set to CONSUMER_PROBE. Otherwise, the device link
+ * is dropped. Links without the DL_FLAG_MANAGED flag set are ignored.
+ */
+void device_links_force_bind(struct device *dev)
+{
+	struct device_link *link, *ln;
+
+	device_links_write_lock();
+
+	list_for_each_entry_safe(link, ln, &dev->links.suppliers, c_node) {
+		if (!(link->flags & DL_FLAG_MANAGED))
+			continue;
+
+		if (link->status != DL_STATE_AVAILABLE) {
+			device_link_drop_managed(link);
+			continue;
+		}
+		WRITE_ONCE(link->status, DL_STATE_CONSUMER_PROBE);
+	}
+	dev->links.status = DL_DEV_PROBING;
+
+	device_links_write_unlock();
+}
+
+/**
  * device_links_driver_bound - Update device links after probing its driver.
  * @dev: Device to update the links for.
  *
@@ -1552,6 +1590,52 @@ static void fw_devlink_parse_fwtree(struct fwnode_handle *fwnode)
 		fw_devlink_parse_fwtree(child);
 }
 
+static void fw_devlink_relax_link(struct device_link *link)
+{
+	if (!(link->flags & DL_FLAG_INFERRED))
+		return;
+
+	if (link->flags == (DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE))
+		return;
+
+	pm_runtime_drop_link(link);
+	link->flags = DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE;
+	dev_dbg(link->consumer, "Relaxing link with %s\n",
+		dev_name(link->supplier));
+}
+
+static int fw_devlink_no_driver(struct device *dev, void *data)
+{
+	struct device_link *link = to_devlink(dev);
+
+	if (!link->supplier->can_match)
+		fw_devlink_relax_link(link);
+
+	return 0;
+}
+
+void fw_devlink_drivers_done(void)
+{
+	fw_devlink_drv_reg_done = true;
+	device_links_write_lock();
+	class_for_each_device(&devlink_class, NULL, NULL,
+			      fw_devlink_no_driver);
+	device_links_write_unlock();
+}
+
+static void fw_devlink_unblock_consumers(struct device *dev)
+{
+	struct device_link *link;
+
+	if (!fw_devlink_flags || fw_devlink_is_permissive())
+		return;
+
+	device_links_write_lock();
+	list_for_each_entry(link, &dev->links.consumers, s_node)
+		fw_devlink_relax_link(link);
+	device_links_write_unlock();
+}
+
 /**
  * fw_devlink_relax_cycle - Convert cyclic links to SYNC_STATE_ONLY links
  * @con: Device to check dependencies for.
@@ -1588,21 +1672,16 @@ static int fw_devlink_relax_cycle(struct device *con, void *sup)
 
 		ret = 1;
 
-		if (!(link->flags & DL_FLAG_INFERRED))
-			continue;
-
-		pm_runtime_drop_link(link);
-		link->flags = DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE;
-		dev_dbg(link->consumer, "Relaxing link with %s\n",
-			dev_name(link->supplier));
+		fw_devlink_relax_link(link);
 	}
 	return ret;
 }
 
 /**
  * fw_devlink_create_devlink - Create a device link from a consumer to fwnode
- * @con - Consumer device for the device link
- * @sup_handle - fwnode handle of supplier
+ * @con: consumer device for the device link
+ * @sup_handle: fwnode handle of supplier
+ * @flags: devlink flags
  *
  * This function will try to create a device link between the consumer device
  * @con and the supplier device represented by @sup_handle.
@@ -1698,7 +1777,7 @@ out:
 
 /**
  * __fw_devlink_link_to_consumers - Create device links to consumers of a device
- * @dev - Device that needs to be linked to its consumers
+ * @dev: Device that needs to be linked to its consumers
  *
  * This function looks at all the consumer fwnodes of @dev and creates device
  * links between the consumer device and @dev (supplier).
@@ -1768,8 +1847,8 @@ static void __fw_devlink_link_to_consumers(struct device *dev)
 
 /**
  * __fw_devlink_link_to_suppliers - Create device links to suppliers of a device
- * @dev - The consumer device that needs to be linked to its suppliers
- * @fwnode - Root of the fwnode tree that is used to create device links
+ * @dev: The consumer device that needs to be linked to its suppliers
+ * @fwnode: Root of the fwnode tree that is used to create device links
  *
  * This function looks at all the supplier fwnodes of fwnode tree rooted at
  * @fwnode and creates device links between @dev (consumer) and all the
@@ -1907,24 +1986,24 @@ static inline int device_is_not_partition(struct device *dev)
 }
 #endif
 
-static int
-device_platform_notify(struct device *dev, enum kobject_action action)
+static void device_platform_notify(struct device *dev)
 {
-	int ret;
+	acpi_device_notify(dev);
 
-	ret = acpi_platform_notify(dev, action);
-	if (ret)
-		return ret;
+	software_node_notify(dev);
 
-	ret = software_node_notify(dev, action);
-	if (ret)
-		return ret;
-
-	if (platform_notify && action == KOBJ_ADD)
+	if (platform_notify)
 		platform_notify(dev);
-	else if (platform_notify_remove && action == KOBJ_REMOVE)
+}
+
+static void device_platform_notify_remove(struct device *dev)
+{
+	acpi_device_notify_remove(dev);
+
+	software_node_notify_remove(dev);
+
+	if (platform_notify_remove)
 		platform_notify_remove(dev);
-	return 0;
 }
 
 /**
@@ -3185,9 +3264,7 @@ int device_add(struct device *dev)
 	}
 
 	/* notify platform of device entry */
-	error = device_platform_notify(dev, KOBJ_ADD);
-	if (error)
-		goto platform_error;
+	device_platform_notify(dev);
 
 	error = device_create_file(dev, &dev_attr_uevent);
 	if (error)
@@ -3246,6 +3323,15 @@ int device_add(struct device *dev)
 	}
 
 	bus_probe_device(dev);
+
+	/*
+	 * If all driver registration is done and a newly added device doesn't
+	 * match with any driver, don't block its consumers from probing in
+	 * case the consumer device is able to operate without this supplier.
+	 */
+	if (dev->fwnode && fw_devlink_drv_reg_done && !dev->can_match)
+		fw_devlink_unblock_consumers(dev);
+
 	if (parent)
 		klist_add_tail(&dev->p->knode_parent,
 			       &parent->p->klist_children);
@@ -3281,8 +3367,7 @@ done:
  SymlinkError:
 	device_remove_file(dev, &dev_attr_uevent);
  attrError:
-	device_platform_notify(dev, KOBJ_REMOVE);
-platform_error:
+	device_platform_notify_remove(dev);
 	kobject_uevent(&dev->kobj, KOBJ_REMOVE);
 	glue_dir = get_glue_dir(dev);
 	kobject_del(&dev->kobj);
@@ -3357,7 +3442,7 @@ bool kill_device(struct device *dev)
 	 * to run while we are tearing out the bus/class/sysfs from
 	 * underneath the device.
 	 */
-	lockdep_assert_held(&dev->mutex);
+	device_lock_assert(dev);
 
 	if (dev->p->dead)
 		return false;
@@ -3425,7 +3510,7 @@ void device_del(struct device *dev)
 	bus_remove_device(dev);
 	device_pm_remove(dev);
 	driver_deferred_probe_del(dev);
-	device_platform_notify(dev, KOBJ_REMOVE);
+	device_platform_notify_remove(dev);
 	device_remove_properties(dev);
 	device_links_purge(dev);
 
@@ -4611,6 +4696,13 @@ int device_match_acpi_dev(struct device *dev, const void *adev)
 	return ACPI_COMPANION(dev) == adev;
 }
 EXPORT_SYMBOL(device_match_acpi_dev);
+
+void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
+{
+	dev->fwnode = fwnode;
+	dev->of_node = to_of_node(fwnode);
+}
+EXPORT_SYMBOL_GPL(device_set_node);
 
 int device_match_name(struct device *dev, const void *name)
 {

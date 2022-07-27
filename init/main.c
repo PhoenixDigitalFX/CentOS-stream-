@@ -39,6 +39,7 @@
 #include <linux/smp.h>
 #include <linux/profile.h>
 #include <linux/rcupdate.h>
+#include <linux/srcu.h>
 #include <linux/moduleparam.h>
 #include <linux/kallsyms.h>
 #include <linux/writeback.h>
@@ -576,6 +577,8 @@ asmlinkage __visible void __init start_kernel(void)
 
 	pr_notice("Kernel command line: %s\n", boot_command_line);
 	pr_notice("Specific versions of hardware are certified with Red Hat Enterprise Linux 8. Please see the list of hardware certified with Red Hat Enterprise Linux 8 at https://catalog.redhat.com.\n");
+	/* parameters may set static keys */
+	jump_label_init();
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,
@@ -584,8 +587,6 @@ asmlinkage __visible void __init start_kernel(void)
 	if (!IS_ERR_OR_NULL(after_dashes))
 		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
 			   NULL, set_init_arg);
-
-	jump_label_init();
 
 	/*
 	 * These use large bootmem allocations and must precede
@@ -646,6 +647,7 @@ asmlinkage __visible void __init start_kernel(void)
 	tick_init();
 	rcu_init_nohz();
 	init_timers();
+	srcu_init();
 	hrtimers_init();
 	softirq_init();
 	timekeeping_init();

@@ -91,6 +91,11 @@ static unsigned int xprt_max_resvport_limit = RPC_MAX_RESVPORT;
 
 static struct ctl_table_header *sunrpc_table_header;
 
+static struct xprt_class xs_local_transport;
+static struct xprt_class xs_udp_transport;
+static struct xprt_class xs_tcp_transport;
+static struct xprt_class xs_bc_tcp_transport;
+
 /*
  * FIXME: changing the UDP slot table size should also resize the UDP
  *        socket buffers for existing UDP transports
@@ -1645,6 +1650,36 @@ static int xs_get_srcport(struct sock_xprt *transport)
 	return port;
 }
 
+static unsigned short xs_sock_srcport(struct rpc_xprt *xprt)
+{
+	struct sock_xprt *sock = container_of(xprt, struct sock_xprt, xprt);
+	unsigned short ret = 0;
+	mutex_lock(&sock->recv_mutex);
+	if (sock->sock)
+		ret = xs_sock_getport(sock->sock);
+	mutex_unlock(&sock->recv_mutex);
+	return ret;
+}
+
+static int xs_sock_srcaddr(struct rpc_xprt *xprt, char *buf, size_t buflen)
+{
+	struct sock_xprt *sock = container_of(xprt, struct sock_xprt, xprt);
+	union {
+		struct sockaddr sa;
+		struct sockaddr_storage st;
+	} saddr;
+	int ret = -ENOTCONN;
+
+	mutex_lock(&sock->recv_mutex);
+	if (sock->sock) {
+		ret = kernel_getsockname(sock->sock, &saddr.sa);
+		if (ret >= 0)
+			ret = snprintf(buf, buflen, "%pISc", &saddr.sa);
+	}
+	mutex_unlock(&sock->recv_mutex);
+	return ret;
+}
+
 static unsigned short xs_next_srcport(struct sock_xprt *transport, unsigned short port)
 {
 	if (transport->srcport != 0)
@@ -1720,15 +1755,15 @@ static void xs_local_set_port(struct rpc_xprt *xprt, unsigned short port)
 }
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
-static struct lock_class_key xs_key[2];
-static struct lock_class_key xs_slock_key[2];
+static struct lock_class_key xs_key[3];
+static struct lock_class_key xs_slock_key[3];
 
 static inline void xs_reclassify_socketu(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
 
 	sock_lock_init_class_and_name(sk, "slock-AF_LOCAL-RPC",
-		&xs_slock_key[1], "sk_lock-AF_LOCAL-RPC", &xs_key[1]);
+		&xs_slock_key[0], "sk_lock-AF_LOCAL-RPC", &xs_key[0]);
 }
 
 static inline void xs_reclassify_socket4(struct socket *sock)
@@ -1736,7 +1771,7 @@ static inline void xs_reclassify_socket4(struct socket *sock)
 	struct sock *sk = sock->sk;
 
 	sock_lock_init_class_and_name(sk, "slock-AF_INET-RPC",
-		&xs_slock_key[0], "sk_lock-AF_INET-RPC", &xs_key[0]);
+		&xs_slock_key[1], "sk_lock-AF_INET-RPC", &xs_key[1]);
 }
 
 static inline void xs_reclassify_socket6(struct socket *sock)
@@ -1744,7 +1779,7 @@ static inline void xs_reclassify_socket6(struct socket *sock)
 	struct sock *sk = sock->sk;
 
 	sock_lock_init_class_and_name(sk, "slock-AF_INET6-RPC",
-		&xs_slock_key[1], "sk_lock-AF_INET6-RPC", &xs_key[1]);
+		&xs_slock_key[2], "sk_lock-AF_INET6-RPC", &xs_key[2]);
 }
 
 static inline void xs_reclassify_socket(int family, struct socket *sock)
@@ -2089,12 +2124,15 @@ static void xs_tcp_shutdown(struct rpc_xprt *xprt)
 		return;
 	}
 	switch (skst) {
-	default:
+	case TCP_FIN_WAIT1:
+	case TCP_FIN_WAIT2:
+		break;
+	case TCP_ESTABLISHED:
+	case TCP_CLOSE_WAIT:
 		kernel_sock_shutdown(sock, SHUT_RDWR);
 		trace_rpc_socket_shutdown(xprt, sock);
 		break;
-	case TCP_CLOSE:
-	case TCP_TIME_WAIT:
+	default:
 		xs_reset_transport(transport);
 	}
 }
@@ -2159,7 +2197,6 @@ static void xs_tcp_set_connect_timeout(struct rpc_xprt *xprt,
 static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
 {
 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
-	int ret = -ENOTCONN;
 
 	if (!transport->inet) {
 		struct sock *sk = sock->sk;
@@ -2202,7 +2239,7 @@ static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
 	}
 
 	if (!xprt_bound(xprt))
-		goto out;
+		return -ENOTCONN;
 
 	xs_set_memalloc(xprt);
 
@@ -2210,22 +2247,7 @@ static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
 
 	/* Tell the socket layer to start connecting... */
 	set_bit(XPRT_SOCK_CONNECTING, &transport->sock_state);
-	ret = kernel_connect(sock, xs_addr(xprt), xprt->addrlen, O_NONBLOCK);
-	switch (ret) {
-	case 0:
-		xs_set_srcport(transport, sock);
-		/* fall through */
-	case -EINPROGRESS:
-		/* SYN_SENT! */
-		if (xprt->reestablish_timeout < XS_TCP_INIT_REEST_TO)
-			xprt->reestablish_timeout = XS_TCP_INIT_REEST_TO;
-		break;
-	case -EADDRNOTAVAIL:
-		/* Source port number is unavailable. Try a new one! */
-		transport->srcport = 0;
-	}
-out:
-	return ret;
+	return kernel_connect(sock, xs_addr(xprt), xprt->addrlen, O_NONBLOCK);
 }
 
 /**
@@ -2240,14 +2262,14 @@ static void xs_tcp_setup_socket(struct work_struct *work)
 		container_of(work, struct sock_xprt, connect_worker.work);
 	struct socket *sock = transport->sock;
 	struct rpc_xprt *xprt = &transport->xprt;
-	int status = -EIO;
+	int status;
 
 	if (!sock) {
 		sock = xs_create_sock(xprt, transport,
 				xs_addr(xprt)->sa_family, SOCK_STREAM,
 				IPPROTO_TCP, true);
 		if (IS_ERR(sock)) {
-			status = PTR_ERR(sock);
+			xprt_wake_pending_tasks(xprt, PTR_ERR(sock));
 			goto out;
 		}
 	}
@@ -2264,21 +2286,21 @@ static void xs_tcp_setup_socket(struct work_struct *work)
 			xprt, -status, xprt_connected(xprt),
 			sock->sk->sk_state);
 	switch (status) {
-	default:
-		printk("%s: connect returned unhandled error %d\n",
-			__func__, status);
-		/* fall through */
-	case -EADDRNOTAVAIL:
-		/* We're probably in TIME_WAIT. Get rid of existing socket,
-		 * and retry
-		 */
-		xs_tcp_force_close(xprt);
-		break;
 	case 0:
+		xs_set_srcport(transport, sock);
+		/* fall through */
 	case -EINPROGRESS:
+		/* SYN_SENT! */
+		if (xprt->reestablish_timeout < XS_TCP_INIT_REEST_TO)
+			xprt->reestablish_timeout = XS_TCP_INIT_REEST_TO;
+		/* fall through */
 	case -EALREADY:
-		xprt_unlock_connect(xprt, transport);
-		return;
+		goto out_unlock;
+	case -EADDRNOTAVAIL:
+		/* Source port number is unavailable. Try a new one! */
+		transport->srcport = 0;
+		status = -EAGAIN;
+		break;
 	case -EINVAL:
 		/* Happens, for instance, if the user specified a link
 		 * local IPv6 address without a scope-id.
@@ -2290,18 +2312,22 @@ static void xs_tcp_setup_socket(struct work_struct *work)
 	case -EHOSTUNREACH:
 	case -EADDRINUSE:
 	case -ENOBUFS:
-		/* xs_tcp_force_close() wakes tasks with a fixed error code.
-		 * We need to wake them first to ensure the correct error code.
-		 */
-		xprt_wake_pending_tasks(xprt, status);
-		xs_tcp_force_close(xprt);
-		goto out;
+		break;
+	default:
+		printk("%s: connect returned unhandled error %d\n",
+			__func__, status);
+		status = -EAGAIN;
 	}
-	status = -EAGAIN;
+
+	/* xs_tcp_force_close() wakes tasks with a fixed error code.
+	 * We need to wake them first to ensure the correct error code.
+	 */
+	xprt_wake_pending_tasks(xprt, status);
+	xs_tcp_force_close(xprt);
 out:
 	xprt_clear_connecting(xprt);
+out_unlock:
 	xprt_unlock_connect(xprt, transport);
-	xprt_wake_pending_tasks(xprt, status);
 }
 
 /**
@@ -2627,6 +2653,8 @@ static const struct rpc_xprt_ops xs_udp_ops = {
 	.rpcbind		= rpcb_getport_async,
 	.set_port		= xs_set_port,
 	.connect		= xs_connect,
+	.get_srcaddr		= xs_sock_srcaddr,
+	.get_srcport		= xs_sock_srcport,
 	.buf_alloc		= rpc_malloc,
 	.buf_free		= rpc_free,
 	.send_request		= xs_udp_send_request,
@@ -2649,6 +2677,8 @@ static const struct rpc_xprt_ops xs_tcp_ops = {
 	.rpcbind		= rpcb_getport_async,
 	.set_port		= xs_set_port,
 	.connect		= xs_connect,
+	.get_srcaddr		= xs_sock_srcaddr,
+	.get_srcport		= xs_sock_srcport,
 	.buf_alloc		= rpc_malloc,
 	.buf_free		= rpc_free,
 	.prepare_request	= xs_stream_prepare_request,
@@ -2783,6 +2813,7 @@ static struct rpc_xprt *xs_setup_local(struct xprt_create *args)
 	transport = container_of(xprt, struct sock_xprt, xprt);
 
 	xprt->prot = 0;
+	xprt->xprt_class = &xs_local_transport;
 	xprt->max_payload = RPC_MAX_FRAGMENT_SIZE;
 
 	xprt->bind_timeout = XS_BIND_TO;
@@ -2852,6 +2883,7 @@ static struct rpc_xprt *xs_setup_udp(struct xprt_create *args)
 	transport = container_of(xprt, struct sock_xprt, xprt);
 
 	xprt->prot = IPPROTO_UDP;
+	xprt->xprt_class = &xs_udp_transport;
 	/* XXX: header size can vary due to auth type, IPv6, etc. */
 	xprt->max_payload = (1U << 16) - (MAX_HEADER << 3);
 
@@ -2932,6 +2964,7 @@ static struct rpc_xprt *xs_setup_tcp(struct xprt_create *args)
 	transport = container_of(xprt, struct sock_xprt, xprt);
 
 	xprt->prot = IPPROTO_TCP;
+	xprt->xprt_class = &xs_tcp_transport;
 	xprt->max_payload = RPC_MAX_FRAGMENT_SIZE;
 
 	xprt->bind_timeout = XS_BIND_TO;
@@ -3005,6 +3038,7 @@ static struct rpc_xprt *xs_setup_bc_tcp(struct xprt_create *args)
 	transport = container_of(xprt, struct sock_xprt, xprt);
 
 	xprt->prot = IPPROTO_TCP;
+	xprt->xprt_class = &xs_bc_tcp_transport;
 	xprt->max_payload = RPC_MAX_FRAGMENT_SIZE;
 	xprt->timeout = &xs_tcp_default_timeout;
 

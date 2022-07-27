@@ -3517,7 +3517,7 @@ static netdev_features_t gso_features_check(const struct sk_buff *skb,
 {
 	u16 gso_segs = skb_shinfo(skb)->gso_segs;
 
-	if (gso_segs > dev->gso_max_segs)
+	if (gso_segs > READ_ONCE(dev->gso_max_segs))
 		return features & ~NETIF_F_GSO_MASK;
 
 	/* Support for GSO partial features requires software
@@ -4155,7 +4155,10 @@ static int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	if (dev->flags & IFF_UP) {
 		int cpu = smp_processor_id(); /* ok because BHs are off */
 
-		if (txq->xmit_lock_owner != cpu) {
+		/* Other cpus might concurrently change txq->xmit_lock_owner
+		 * to -1 or to their cpu id, but not to our id.
+		 */
+		if (READ_ONCE(txq->xmit_lock_owner) != cpu) {
 			if (dev_xmit_recursion())
 				goto recursion_alert;
 
@@ -4744,7 +4747,7 @@ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
 			skb_metadata_set(skb, metalen);
 		break;
 	default:
-		bpf_warn_invalid_xdp_action(act);
+		bpf_warn_invalid_xdp_action(skb->dev, xdp_prog, act);
 		/* fall through */
 	case XDP_ABORTED:
 		trace_xdp_exception(skb->dev, xdp_prog, act);
@@ -9317,14 +9320,17 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	struct net_device *dev;
 	int err, fd;
 
+	rtnl_lock();
 	dev = dev_get_by_index(net, attr->link_create.target_ifindex);
-	if (!dev)
+	if (!dev) {
+		rtnl_unlock();
 		return -EINVAL;
+	}
 
 	link = kzalloc(sizeof(*link), GFP_USER);
 	if (!link) {
 		err = -ENOMEM;
-		goto out_put_dev;
+		goto unlock;
 	}
 
 	bpf_link_init(&link->link, BPF_LINK_TYPE_XDP, &bpf_xdp_link_lops, prog);
@@ -9334,14 +9340,14 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	err = bpf_link_prime(&link->link, &link_primer);
 	if (err) {
 		kfree(link);
-		goto out_put_dev;
+		goto unlock;
 	}
 
-	rtnl_lock();
 	err = dev_xdp_attach_link(dev, NULL, link);
 	rtnl_unlock();
 
 	if (err) {
+		link->dev = NULL;
 		bpf_link_cleanup(&link_primer);
 		goto out_put_dev;
 	}
@@ -9350,6 +9356,9 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	/* link itself doesn't hold dev's refcnt to not complicate shutdown */
 	dev_put(dev);
 	return fd;
+
+unlock:
+	rtnl_unlock();
 
 out_put_dev:
 	dev_put(dev);
@@ -10711,11 +10720,13 @@ void unregister_netdev(struct net_device *dev)
 EXPORT_SYMBOL(unregister_netdev);
 
 /**
- *	dev_change_net_namespace - move device to different nethost namespace
+ *	__dev_change_net_namespace - move device to different nethost namespace
  *	@dev: device
  *	@net: network namespace
  *	@pat: If not NULL name pattern to try if the current device name
  *	      is already taken in the destination network namespace.
+ *	@new_ifindex: If not zero, specifies device index in the target
+ *	              namespace.
  *
  *	This function shuts down a device interface and moves it
  *	to a new network namespace. On success 0 is returned, on
@@ -10724,10 +10735,11 @@ EXPORT_SYMBOL(unregister_netdev);
  *	Callers must hold the rtnl semaphore.
  */
 
-int dev_change_net_namespace(struct net_device *dev, struct net *net, const char *pat)
+int __dev_change_net_namespace(struct net_device *dev, struct net *net,
+			       const char *pat, int new_ifindex)
 {
 	struct net *net_old = dev_net(dev);
-	int err, new_nsid, new_ifindex;
+	int err, new_nsid;
 
 	ASSERT_RTNL();
 
@@ -10758,6 +10770,11 @@ int dev_change_net_namespace(struct net_device *dev, struct net *net, const char
 			goto out;
 	}
 
+	/* Check that new_ifindex isn't used yet. */
+	err = -EBUSY;
+	if (new_ifindex && __dev_get_by_index(net, new_ifindex))
+		goto out;
+
 	/*
 	 * And now a mini version of register_netdevice unregister_netdevice.
 	 */
@@ -10785,10 +10802,12 @@ int dev_change_net_namespace(struct net_device *dev, struct net *net, const char
 
 	new_nsid = peernet2id_alloc(dev_net(dev), net, GFP_KERNEL);
 	/* If there is an ifindex conflict assign a new one */
-	if (__dev_get_by_index(net, dev->ifindex))
-		new_ifindex = dev_new_index(net);
-	else
-		new_ifindex = dev->ifindex;
+	if (!new_ifindex) {
+		if (__dev_get_by_index(net, dev->ifindex))
+			new_ifindex = dev_new_index(net);
+		else
+			new_ifindex = dev->ifindex;
+	}
 
 	rtmsg_ifinfo_newnet(RTM_DELLINK, dev, ~0U, GFP_KERNEL, &new_nsid,
 			    new_ifindex);
@@ -10841,7 +10860,7 @@ int dev_change_net_namespace(struct net_device *dev, struct net *net, const char
 out:
 	return err;
 }
-EXPORT_SYMBOL_GPL(dev_change_net_namespace);
+EXPORT_SYMBOL_GPL(__dev_change_net_namespace);
 
 static int dev_cpu_dead(unsigned int oldcpu)
 {

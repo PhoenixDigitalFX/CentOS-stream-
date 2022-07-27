@@ -31,7 +31,7 @@ static bool host_quit;
 static int iteration;
 static int vcpu_last_completed_iteration[KVM_MAX_VCPUS];
 
-static void *vcpu_worker(void *data)
+static void vcpu_worker(struct perf_test_vcpu_args *vcpu_args)
 {
 	int ret;
 	struct kvm_vm *vm = perf_test_args.vm;
@@ -41,7 +41,6 @@ static void *vcpu_worker(void *data)
 	struct timespec ts_diff;
 	struct timespec total = (struct timespec){0};
 	struct timespec avg;
-	struct perf_test_vcpu_args *vcpu_args = (struct perf_test_vcpu_args *)data;
 	int vcpu_id = vcpu_args->vcpu_id;
 
 	run = vcpu_state(vm, vcpu_id);
@@ -83,8 +82,6 @@ static void *vcpu_worker(void *data)
 	pr_debug("\nvCPU %d dirtied 0x%lx pages over %d iterations in %ld.%.9lds. (Avg %ld.%.9lds/iteration)\n",
 		vcpu_id, pages_count, vcpu_last_completed_iteration[vcpu_id],
 		total.tv_sec, total.tv_nsec, avg.tv_sec, avg.tv_nsec);
-
-	return NULL;
 }
 
 struct test_params {
@@ -170,7 +167,6 @@ static void free_bitmaps(unsigned long *bitmaps[], int slots)
 static void run_test(enum vm_guest_mode mode, void *arg)
 {
 	struct test_params *p = arg;
-	pthread_t *vcpu_threads;
 	struct kvm_vm *vm;
 	unsigned long **bitmaps;
 	uint64_t guest_num_pages;
@@ -186,9 +182,10 @@ static void run_test(enum vm_guest_mode mode, void *arg)
 	struct timespec clear_dirty_log_total = (struct timespec){0};
 
 	vm = perf_test_create_vm(mode, nr_vcpus, guest_percpu_mem_size,
-				 p->slots, p->backing_src);
+				 p->slots, p->backing_src,
+				 p->partition_vcpu_memory_access);
 
-	perf_test_args.wr_fract = p->wr_fract;
+	perf_test_set_wr_fract(vm, p->wr_fract);
 
 	guest_num_pages = (nr_vcpus * guest_percpu_mem_size) >> vm_get_page_shift(vm);
 	guest_num_pages = vm_adjust_num_guest_pages(mode, guest_num_pages);
@@ -203,25 +200,15 @@ static void run_test(enum vm_guest_mode mode, void *arg)
 		vm_enable_cap(vm, &cap);
 	}
 
-	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
-	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
-
-	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size,
-			      p->partition_vcpu_memory_access);
-
-	sync_global_to_guest(vm, perf_test_args);
-
 	/* Start the iterations */
 	iteration = 0;
 	host_quit = false;
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
-	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++) {
+	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++)
 		vcpu_last_completed_iteration[vcpu_id] = -1;
 
-		pthread_create(&vcpu_threads[vcpu_id], NULL, vcpu_worker,
-			       &perf_test_args.vcpu_args[vcpu_id]);
-	}
+	perf_test_start_vcpu_threads(nr_vcpus, vcpu_worker);
 
 	/* Allow the vCPUs to populate memory */
 	pr_debug("Starting iteration %d - Populating\n", iteration);
@@ -290,8 +277,7 @@ static void run_test(enum vm_guest_mode mode, void *arg)
 
 	/* Tell the vcpu thread to quit */
 	host_quit = true;
-	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++)
-		pthread_join(vcpu_threads[vcpu_id], NULL);
+	perf_test_join_vcpu_threads(nr_vcpus);
 
 	avg = timespec_div(get_dirty_log_total, p->iterations);
 	pr_info("Get dirty log over %lu iterations took %ld.%.9lds. (Avg %ld.%.9lds/iteration)\n",
@@ -306,19 +292,24 @@ static void run_test(enum vm_guest_mode mode, void *arg)
 	}
 
 	free_bitmaps(bitmaps, p->slots);
-	free(vcpu_threads);
 	perf_test_destroy_vm(vm);
 }
 
 static void help(char *name)
 {
 	puts("");
-	printf("usage: %s [-h] [-i iterations] [-p offset] "
+	printf("usage: %s [-h] [-i iterations] [-p offset] [-g]"
 	       "[-m mode] [-b vcpu bytes] [-v vcpus] [-o] [-s mem type]"
 	       "[-x memslots]\n", name);
 	puts("");
 	printf(" -i: specify iteration counts (default: %"PRIu64")\n",
 	       TEST_HOST_LOOP_N);
+	printf(" -g: Do not enable KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2. This\n"
+	       "     makes KVM_GET_DIRTY_LOG clear the dirty log (i.e.\n"
+	       "     KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE is not enabled)\n"
+	       "     and writes will be tracked as soon as dirty logging is\n"
+	       "     enabled on the memslot (i.e. KVM_DIRTY_LOG_INITIALLY_SET\n"
+	       "     is not enabled).\n");
 	printf(" -p: specify guest physical test memory offset\n"
 	       "     Warning: a low offset can conflict with the loaded test code.\n");
 	guest_modes_help();
@@ -358,8 +349,11 @@ int main(int argc, char *argv[])
 
 	guest_modes_append_default();
 
-	while ((opt = getopt(argc, argv, "hi:p:m:b:f:v:os:x:")) != -1) {
+	while ((opt = getopt(argc, argv, "ghi:p:m:b:f:v:os:x:")) != -1) {
 		switch (opt) {
+		case 'g':
+			dirty_log_manual_caps = 0;
+			break;
 		case 'i':
 			p.iterations = atoi(optarg);
 			break;

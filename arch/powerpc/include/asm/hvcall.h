@@ -322,7 +322,8 @@
 #define H_SCM_HEALTH            0x400
 #define H_SCM_PERFORMANCE_STATS 0x418
 #define H_RPT_INVALIDATE	0x448
-#define MAX_HCALL_OPCODE	H_RPT_INVALIDATE
+#define H_GET_ENERGY_SCALE_INFO	0x450
+#define MAX_HCALL_OPCODE	H_GET_ENERGY_SCALE_INFO
 
 /* Scope args for H_SCM_UNBIND_ALL */
 #define H_UNBIND_SCOPE_ALL (0x1)
@@ -580,16 +581,22 @@ struct hv_guest_state {
 	u64 pidr;
 	u64 cfar;
 	u64 ppr;
+	/* Version 1 ends here */
+	u64 dawr1;
+	u64 dawrx1;
+	/* Version 2 ends here */
 };
 
 /* Latest version of hv_guest_state structure */
-#define HV_GUEST_STATE_VERSION	1
+#define HV_GUEST_STATE_VERSION	2
 
 static inline int hv_guest_state_size(unsigned int version)
 {
 	switch (version) {
 	case 1:
 		return offsetofend(struct hv_guest_state, ppr);
+	case 2:
+		return offsetofend(struct hv_guest_state, dawrx1);
 	default:
 		return -1;
 	}

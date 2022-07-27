@@ -119,7 +119,7 @@ static int setup_dtb(struct kimage *image,
 
 	/* add kaslr-seed */
 	ret = fdt_delprop(dtb, off, FDT_PROP_KASLR_SEED);
-	if  (ret == -FDT_ERR_NOTFOUND)
+	if (ret == -FDT_ERR_NOTFOUND)
 		ret = 0;
 	else if (ret)
 		goto out;
@@ -269,14 +269,14 @@ int load_other_segments(struct kimage *image,
 		image->arch.elf_headers_sz = headers_sz;
 
 		pr_debug("Loaded elf core header at 0x%lx bufsz=0x%lx memsz=0x%lx\n",
-			 image->arch.elf_headers_mem, headers_sz, headers_sz);
+			 image->arch.elf_headers_mem, kbuf.bufsz, kbuf.memsz);
 	}
 
 	/* load initrd */
 	if (initrd) {
 		kbuf.buffer = initrd;
 		kbuf.bufsz = initrd_len;
-		kbuf.mem = 0;
+		kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
 		kbuf.memsz = initrd_len;
 		kbuf.buf_align = 0;
 		/* within 1GB-aligned window of up to 32GB in size */
@@ -290,7 +290,7 @@ int load_other_segments(struct kimage *image,
 		initrd_load_addr = kbuf.mem;
 
 		pr_debug("Loaded initrd at 0x%lx bufsz=0x%lx memsz=0x%lx\n",
-				initrd_load_addr, initrd_len, initrd_len);
+				initrd_load_addr, kbuf.bufsz, kbuf.memsz);
 	}
 
 	/* load dtb */
@@ -303,7 +303,7 @@ int load_other_segments(struct kimage *image,
 	dtb_len = fdt_totalsize(dtb);
 	kbuf.buffer = dtb;
 	kbuf.bufsz = dtb_len;
-	kbuf.mem = 0;
+	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
 	kbuf.memsz = dtb_len;
 	/* not across 2MB boundary */
 	kbuf.buf_align = SZ_2M;
@@ -317,7 +317,7 @@ int load_other_segments(struct kimage *image,
 	image->arch.dtb_mem = kbuf.mem;
 
 	pr_debug("Loaded dtb at 0x%lx bufsz=0x%lx memsz=0x%lx\n",
-			kbuf.mem, dtb_len, dtb_len);
+			kbuf.mem, kbuf.bufsz, kbuf.memsz);
 
 	return 0;
 

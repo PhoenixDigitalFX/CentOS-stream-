@@ -94,6 +94,7 @@
 #include <linux/thread_info.h>
 #include <linux/scs.h>
 #include <linux/kasan.h>
+#include <linux/sched/mm.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -105,6 +106,7 @@
 #include <trace/events/sched.h>
 
 #include <linux/rh_tasklist_lock.h>
+#include <linux/rh_kabi_aux.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
@@ -957,6 +959,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->use_memdelay = 0;
 #endif
 
+#ifdef CONFIG_IOMMU_SVA
+	tsk->pasid_activated = 0;
+#endif
+
 #ifdef CONFIG_MEMCG
 	tsk->active_memcg = NULL;
 #endif
@@ -1031,7 +1037,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_pgtables_bytes_init(mm);
 	mm->map_count = 0;
 	mm->locked_vm = 0;
-	atomic_set(&mm->has_pinned, 0);
 	atomic64_set(&mm->pinned_vm, 0);
 	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));
 	spin_lock_init(&mm->page_table_lock);
@@ -1039,6 +1044,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_init_cpumask(mm);
 	mm_init_aio(mm);
 	mm_init_owner(mm, p);
+	mm_pasid_init(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
 	mmu_notifier_subscriptions_init(mm);
 	init_tlb_flush_pending(mm);
@@ -1109,6 +1115,7 @@ static inline void __mmput(struct mm_struct *mm)
 	}
 	if (mm->binfmt)
 		module_put(mm->binfmt->module);
+	mm_pasid_drop(mm);
 	mmdrop(mm);
 }
 
@@ -1746,8 +1753,45 @@ static void pidfd_show_fdinfo(struct seq_file *m, struct file *f)
 }
 #endif
 
+static int wait_pidfd_ctor(void *pid, void *wait_pidfd, void *data)
+{
+	init_waitqueue_head(wait_pidfd);
+	return 0;
+}
+/*
+ * Poll support for process exit notification.
+ */
+static __poll_t pidfd_poll(struct file *file, struct poll_table_struct *pts)
+{
+	struct task_struct *task;
+	struct pid *pid = file->private_data;
+	wait_queue_head_t *wait_pidfd;
+	__poll_t poll_flags = 0;
+
+	wait_pidfd = kabi_aux_get_or_alloc(pid, 0, sizeof(wait_queue_head_t),
+					   GFP_KERNEL, wait_pidfd_ctor, NULL);
+	if (wait_pidfd)
+		poll_wait(file, wait_pidfd, pts);
+	else
+		return EPOLLERR;
+
+	rcu_read_lock();
+	task = pid_task(pid, PIDTYPE_PID);
+	/*
+	 * Inform pollers only when the whole thread group exits.
+	 * If the thread group leader exits before all other threads in the
+	 * group, then poll(2) should block, similar to the wait(2) family.
+	 */
+	if (!task || (task->exit_state && thread_group_empty(task)))
+		poll_flags = EPOLLIN | EPOLLRDNORM;
+	rcu_read_unlock();
+
+	return poll_flags;
+}
+
 const struct file_operations pidfd_fops = {
 	.release = pidfd_release,
+	.poll = pidfd_poll,
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo = pidfd_show_fdinfo,
 #endif

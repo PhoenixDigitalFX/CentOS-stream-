@@ -122,7 +122,7 @@ struct fwnode_handle *device_get_named_child_node(struct device *dev,
 struct fwnode_handle *fwnode_handle_get(struct fwnode_handle *fwnode);
 void fwnode_handle_put(struct fwnode_handle *fwnode);
 
-int fwnode_irq_get(struct fwnode_handle *fwnode, unsigned int index);
+int fwnode_irq_get(const struct fwnode_handle *fwnode, unsigned int index);
 
 unsigned int device_get_child_node_count(struct device *dev);
 
@@ -244,6 +244,13 @@ struct software_node_ref_args {
 	u64 args[NR_FWNODE_REFERENCE_ARGS];
 };
 
+#define SOFTWARE_NODE_REFERENCE(_ref_, ...)			\
+(const struct software_node_ref_args) {				\
+	.node = _ref_,						\
+	.nargs = ARRAY_SIZE(((u64[]){ 0, ##__VA_ARGS__ })) - 1,	\
+	.args = { __VA_ARGS__ },				\
+}
+
 /**
  * struct property_entry - "Built-in" device property representation.
  * @name: Name of the property.
@@ -352,11 +359,7 @@ struct property_entry {
 	.name = _name_,							\
 	.length = sizeof(struct software_node_ref_args),		\
 	.type = DEV_PROP_REF,						\
-	{ .pointer = &(const struct software_node_ref_args) {		\
-		.node = _ref_,						\
-		.nargs = ARRAY_SIZE(((u64[]){ 0, ##__VA_ARGS__ })) - 1,	\
-		.args = { __VA_ARGS__ },				\
-	} },								\
+	{ .pointer = &SOFTWARE_NODE_REFERENCE(_ref_, ##__VA_ARGS__), },	\
 }
 
 struct property_entry *
@@ -376,11 +379,7 @@ const void *device_get_match_data(struct device *dev);
 
 int device_get_phy_mode(struct device *dev);
 
-void *device_get_mac_address(struct device *dev, char *addr, int alen);
-
 int fwnode_get_phy_mode(struct fwnode_handle *fwnode);
-void *fwnode_get_mac_address(struct fwnode_handle *fwnode,
-			     char *addr, int alen);
 struct fwnode_handle *fwnode_graph_get_next_endpoint(
 	const struct fwnode_handle *fwnode, struct fwnode_handle *prev);
 struct fwnode_handle *
@@ -451,8 +450,6 @@ void software_node_unregister_node_group(const struct software_node **node_group
 
 int software_node_register(const struct software_node *node);
 void software_node_unregister(const struct software_node *node);
-
-int software_node_notify(struct device *dev, unsigned long action);
 
 struct fwnode_handle *
 fwnode_create_software_node(const struct property_entry *properties,

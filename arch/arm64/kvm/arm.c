@@ -168,20 +168,12 @@ vm_fault_t kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
  */
 void kvm_arch_destroy_vm(struct kvm *kvm)
 {
-	int i;
-
 	kvm_vgic_destroy(kvm);
 
 	free_percpu(kvm->arch.last_vcpu_ran);
 	kvm->arch.last_vcpu_ran = NULL;
 
-	for (i = 0; i < KVM_MAX_VCPUS; ++i) {
-		if (kvm->vcpus[i]) {
-			kvm_vcpu_destroy(kvm->vcpus[i]);
-			kvm->vcpus[i] = NULL;
-		}
-	}
-	atomic_set(&kvm->online_vcpus, 0);
+	kvm_destroy_vcpus(kvm);
 }
 
 int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
@@ -256,14 +248,6 @@ struct kvm *kvm_arch_alloc_vm(void)
 		return kzalloc(sizeof(struct kvm), GFP_KERNEL);
 
 	return vzalloc(sizeof(struct kvm));
-}
-
-void kvm_arch_free_vm(struct kvm *kvm)
-{
-	if (!has_vhe())
-		kfree(kvm);
-	else
-		vfree(kvm);
 }
 
 int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
@@ -457,6 +441,11 @@ bool kvm_arch_vcpu_in_kernel(struct kvm_vcpu *vcpu)
 	return vcpu_mode_priv(vcpu);
 }
 
+unsigned long kvm_arch_vcpu_get_ip(struct kvm_vcpu *vcpu)
+{
+	return *vcpu_pc(vcpu);
+}
+
 /* Just ensure a guest exit from a particular CPU */
 static void exit_vm_noop(void *info)
 {
@@ -587,7 +576,7 @@ bool kvm_arch_intc_initialized(struct kvm *kvm)
 
 void kvm_arm_halt_guest(struct kvm *kvm)
 {
-	int i;
+	unsigned long i;
 	struct kvm_vcpu *vcpu;
 
 	kvm_for_each_vcpu(i, vcpu, kvm)
@@ -597,12 +586,12 @@ void kvm_arm_halt_guest(struct kvm *kvm)
 
 void kvm_arm_resume_guest(struct kvm *kvm)
 {
-	int i;
+	unsigned long i;
 	struct kvm_vcpu *vcpu;
 
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		vcpu->arch.pause = false;
-		rcuwait_wake_up(kvm_arch_vcpu_get_wait(vcpu));
+		__kvm_vcpu_wake_up(vcpu);
 	}
 }
 
@@ -1615,7 +1604,7 @@ static void check_kvm_target_cpu(void *ret)
 struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr)
 {
 	struct kvm_vcpu *vcpu;
-	int i;
+	unsigned long i;
 
 	mpidr &= MPIDR_HWID_BITMASK;
 	kvm_for_each_vcpu(i, vcpu, kvm) {
@@ -1686,7 +1675,8 @@ int kvm_arch_init(void *opaque)
 		return -ENODEV;
 	}
 
-	if (cpus_have_final_cap(ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE))
+	if (cpus_have_final_cap(ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE) ||
+	    cpus_have_final_cap(ARM64_WORKAROUND_1508412))
 		kvm_info("Guests without required CPU erratum workarounds can deadlock system!\n" \
 			 "Only trusted guests should be used on this system.\n");
 

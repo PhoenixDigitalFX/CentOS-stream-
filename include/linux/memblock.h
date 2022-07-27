@@ -29,9 +29,6 @@ extern unsigned long max_pfn;
  */
 extern unsigned long long max_possible_pfn;
 
-#define INIT_MEMBLOCK_REGIONS	128
-#define INIT_PHYSMEM_REGIONS	4
-
 /**
  * enum memblock_flags - definition of memory region attributes
  * @MEMBLOCK_NONE: no special request
@@ -99,13 +96,14 @@ struct memblock {
 extern struct memblock memblock;
 extern int memblock_debug;
 
-#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+#ifndef CONFIG_ARCH_KEEP_MEMBLOCK
 #define __init_memblock __meminit
 #define __initdata_memblock __meminitdata
 void memblock_discard(void);
 #else
 #define __init_memblock
 #define __initdata_memblock
+static inline void memblock_discard(void) {}
 #endif
 
 #define memblock_dbg(fmt, ...) \

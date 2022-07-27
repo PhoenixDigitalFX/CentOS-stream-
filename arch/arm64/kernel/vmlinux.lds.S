@@ -118,9 +118,6 @@ SECTIONS
 	}
 	.text : {			/* Real text segment		*/
 		_stext = .;		/* Text and read-only data	*/
-			__exception_text_start = .;
-			*(.exception.text)
-			__exception_text_end = .;
 			IRQENTRY_TEXT
 			SOFTIRQENTRY_TEXT
 			ENTRY_TEXT
@@ -149,6 +146,7 @@ SECTIONS
 	. = ALIGN(PAGE_SIZE);
 	idmap_pg_dir = .;
 	. += IDMAP_DIR_SIZE;
+	idmap_pg_end = .;
 
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
 	tramp_pg_dir = .;

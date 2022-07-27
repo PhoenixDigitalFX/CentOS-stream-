@@ -33,8 +33,8 @@ void kvmhv_save_hv_regs(struct kvm_vcpu *vcpu, struct hv_guest_state *hr)
 	hr->dpdes = vc->dpdes;
 	hr->hfscr = vcpu->arch.hfscr;
 	hr->tb_offset = vc->tb_offset;
-	hr->dawr0 = vcpu->arch.dawr;
-	hr->dawrx0 = vcpu->arch.dawrx;
+	hr->dawr0 = vcpu->arch.dawr0;
+	hr->dawrx0 = vcpu->arch.dawrx0;
 	hr->ciabr = vcpu->arch.ciabr;
 	hr->purr = vcpu->arch.purr;
 	hr->spurr = vcpu->arch.spurr;
@@ -49,6 +49,8 @@ void kvmhv_save_hv_regs(struct kvm_vcpu *vcpu, struct hv_guest_state *hr)
 	hr->pidr = vcpu->arch.pid;
 	hr->cfar = vcpu->arch.cfar;
 	hr->ppr = vcpu->arch.ppr;
+	hr->dawr1 = vcpu->arch.dawr1;
+	hr->dawrx1 = vcpu->arch.dawrx1;
 }
 
 static void byteswap_pt_regs(struct pt_regs *regs)
@@ -91,6 +93,8 @@ static void byteswap_hv_regs(struct hv_guest_state *hr)
 	hr->pidr = swab64(hr->pidr);
 	hr->cfar = swab64(hr->cfar);
 	hr->ppr = swab64(hr->ppr);
+	hr->dawr1 = swab64(hr->dawr1);
+	hr->dawrx1 = swab64(hr->dawrx1);
 }
 
 static void save_hv_return_state(struct kvm_vcpu *vcpu, int trap,
@@ -163,6 +167,7 @@ static void sanitise_hv_regs(struct kvm_vcpu *vcpu, struct hv_guest_state *hr)
 
 	/* Don't let data address watchpoint match in hypervisor state */
 	hr->dawrx0 &= ~DAWRX_HYP;
+	hr->dawrx1 &= ~DAWRX_HYP;
 
 	/* Don't let completed instruction address breakpt match in HV state */
 	if ((hr->ciabr & CIABR_PRIV) == CIABR_PRIV_HYPER)
@@ -176,8 +181,8 @@ static void restore_hv_regs(struct kvm_vcpu *vcpu, struct hv_guest_state *hr)
 	vc->pcr = hr->pcr | PCR_MASK;
 	vc->dpdes = hr->dpdes;
 	vcpu->arch.hfscr = hr->hfscr;
-	vcpu->arch.dawr = hr->dawr0;
-	vcpu->arch.dawrx = hr->dawrx0;
+	vcpu->arch.dawr0 = hr->dawr0;
+	vcpu->arch.dawrx0 = hr->dawrx0;
 	vcpu->arch.ciabr = hr->ciabr;
 	vcpu->arch.purr = hr->purr;
 	vcpu->arch.spurr = hr->spurr;
@@ -192,6 +197,8 @@ static void restore_hv_regs(struct kvm_vcpu *vcpu, struct hv_guest_state *hr)
 	vcpu->arch.pid = hr->pidr;
 	vcpu->arch.cfar = hr->cfar;
 	vcpu->arch.ppr = hr->ppr;
+	vcpu->arch.dawr1 = hr->dawr1;
+	vcpu->arch.dawrx1 = hr->dawrx1;
 }
 
 void kvmhv_restore_hv_return_state(struct kvm_vcpu *vcpu,
@@ -296,10 +303,10 @@ long kvmhv_enter_nested_guest(struct kvm_vcpu *vcpu)
 	/* copy parameters in */
 	hv_ptr = kvmppc_get_gpr(vcpu, 4);
 	regs_ptr = kvmppc_get_gpr(vcpu, 5);
-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+	kvm_vcpu_srcu_read_lock(vcpu);
 	err = kvmhv_read_guest_state_and_regs(vcpu, &l2_hv, &l2_regs,
 					      hv_ptr, regs_ptr);
-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+	kvm_vcpu_srcu_read_unlock(vcpu);
 	if (err)
 		return H_PARAMETER;
 
@@ -384,10 +391,10 @@ long kvmhv_enter_nested_guest(struct kvm_vcpu *vcpu)
 		byteswap_hv_regs(&l2_hv);
 		byteswap_pt_regs(&l2_regs);
 	}
-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+	kvm_vcpu_srcu_read_lock(vcpu);
 	err = kvmhv_write_guest_state_and_regs(vcpu, &l2_hv, &l2_regs,
 					       hv_ptr, regs_ptr);
-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+	kvm_vcpu_srcu_read_unlock(vcpu);
 	if (err)
 		return H_AUTHORITY;
 
@@ -567,16 +574,16 @@ long kvmhv_copy_tofrom_guest_nested(struct kvm_vcpu *vcpu)
 			goto not_found;
 
 		/* Write what was loaded into our buffer back to the L1 guest */
-		vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+		kvm_vcpu_srcu_read_lock(vcpu);
 		rc = kvm_vcpu_write_guest(vcpu, gp_to, buf, n);
-		srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+		kvm_vcpu_srcu_read_unlock(vcpu);
 		if (rc)
 			goto not_found;
 	} else {
 		/* Load the data to be stored from the L1 guest into our buf */
-		vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+		kvm_vcpu_srcu_read_lock(vcpu);
 		rc = kvm_vcpu_read_guest(vcpu, gp_from, buf, n);
-		srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+		kvm_vcpu_srcu_read_unlock(vcpu);
 		if (rc)
 			goto not_found;
 
@@ -714,7 +721,7 @@ void kvmhv_release_all_nested(struct kvm *kvm)
 	struct kvm_nested_guest *gp;
 	struct kvm_nested_guest *freelist = NULL;
 	struct kvm_memory_slot *memslot;
-	int srcu_idx;
+	int srcu_idx, bkt;
 
 	spin_lock(&kvm->mmu_lock);
 	for (i = 0; i <= kvm->arch.max_nested_lpid; i++) {
@@ -735,7 +742,7 @@ void kvmhv_release_all_nested(struct kvm *kvm)
 	}
 
 	srcu_idx = srcu_read_lock(&kvm->srcu);
-	kvm_for_each_memslot(memslot, kvm_memslots(kvm))
+	kvm_for_each_memslot(memslot, bkt, kvm_memslots(kvm))
 		kvmhv_free_memslot_nest_rmap(memslot);
 	srcu_read_unlock(&kvm->srcu, srcu_idx);
 }
