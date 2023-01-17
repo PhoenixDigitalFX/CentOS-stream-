@@ -42,7 +42,6 @@
 #include <linux/tcp.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
-#include <linux/moduleparam.h>
 #include <linux/indirect_call_wrapper.h>
 
 #include "mlx4_en.h"
@@ -130,6 +129,7 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
 		ring->bf_enabled = !!(priv->pflags &
 				      MLX4_EN_PRIV_FLAGS_BLUEFLAME);
 	}
+	ring->doorbell_address = ring->bf.uar->map + MLX4_SEND_DOORBELL;
 
 	ring->hwtstamp_tx_type = priv->hwtstamp_config.tx_type;
 	ring->queue_index = queue_index;
@@ -297,12 +297,12 @@ u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
 			dma_unmap_single(priv->ddev,
 					 tx_info->map0_dma,
 					 tx_info->map0_byte_count,
-					 PCI_DMA_TODEVICE);
+					 DMA_TO_DEVICE);
 		else
 			dma_unmap_page(priv->ddev,
 				       tx_info->map0_dma,
 				       tx_info->map0_byte_count,
-				       PCI_DMA_TODEVICE);
+				       DMA_TO_DEVICE);
 		/* Optimize the common case when there are no wraparounds */
 		if (likely((void *)tx_desc +
 			   (tx_info->nr_txbb << LOG_TXBB_SIZE) <= end)) {
@@ -311,7 +311,7 @@ u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
 				dma_unmap_page(priv->ddev,
 					(dma_addr_t)be64_to_cpu(data->addr),
 					be32_to_cpu(data->byte_count),
-					PCI_DMA_TODEVICE);
+					DMA_TO_DEVICE);
 			}
 		} else {
 			if ((void *)data >= end)
@@ -325,7 +325,7 @@ u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
 				dma_unmap_page(priv->ddev,
 					(dma_addr_t)be64_to_cpu(data->addr),
 					be32_to_cpu(data->byte_count),
-					PCI_DMA_TODEVICE);
+					DMA_TO_DEVICE);
 			}
 		}
 	}
@@ -642,9 +642,9 @@ static int get_real_size(const struct sk_buff *skb,
 	if (shinfo->gso_size) {
 		*inline_ok = false;
 		if (skb->encapsulation)
-			*lso_header_size = (skb_inner_transport_header(skb) - skb->data) + inner_tcp_hdrlen(skb);
+			*lso_header_size = skb_inner_tcp_all_headers(skb);
 		else
-			*lso_header_size = skb_transport_offset(skb) + tcp_hdrlen(skb);
+			*lso_header_size = skb_tcp_all_headers(skb);
 		real_size = CTRL_SIZE + shinfo->nr_frags * DS_SIZE +
 			ALIGN(*lso_header_size + 4, DS_SIZE);
 		if (unlikely(*lso_header_size != skb_headlen(skb))) {
@@ -754,8 +754,7 @@ void mlx4_en_xmit_doorbell(struct mlx4_en_tx_ring *ring)
 #else
 	iowrite32be(
 #endif
-		  (__force u32)ring->doorbell_qpn,
-		  ring->bf.uar->map + MLX4_SEND_DOORBELL);
+		  (__force u32)ring->doorbell_qpn, ring->doorbell_address);
 }
 
 static void mlx4_en_tx_write_desc(struct mlx4_en_tx_ring *ring,
@@ -832,7 +831,7 @@ static bool mlx4_en_build_dma_wqe(struct mlx4_en_priv *priv,
 
 		dma = dma_map_single(ddev, skb->data +
 				     lso_header_size, byte_count,
-				     PCI_DMA_TODEVICE);
+				     DMA_TO_DEVICE);
 		if (dma_mapping_error(ddev, dma))
 			goto tx_drop_unmap;
 
@@ -854,7 +853,7 @@ tx_drop_unmap:
 		++data;
 		dma_unmap_page(ddev, (dma_addr_t)be64_to_cpu(data->addr),
 			       be32_to_cpu(data->byte_count),
-			       PCI_DMA_TODEVICE);
+			       DMA_TO_DEVICE);
 	}
 
 	return false;
@@ -1171,7 +1170,7 @@ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_ring *rx_ring,
 	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
 
 	dma_sync_single_range_for_device(priv->ddev, dma, frame->page_offset,
-					 length, PCI_DMA_TODEVICE);
+					 length, DMA_TO_DEVICE);
 
 	data->addr = cpu_to_be64(dma + frame->page_offset);
 	dma_wmb();

@@ -2,7 +2,9 @@
 
 ---
 inspections:
+    abidiff: off
     addedfiles: off
+    badfuncs: off
     changedfiles: off
     kmidiff: off
     kmod: off
@@ -12,17 +14,6 @@ inspections:
     removedfiles: off
     rpmdeps: off
     upstream: off
-
-ignore:
-    - /usr/libexec/ksamples/*
-    - /usr/libexec/kselftests/*
-    - /lib/modules/*/internal/*
-    - /usr/src/kernel/*
-
-badfuncs:
-    ignore:
-        - /usr/libexec/ksamples/*
-        - /usr/libexec/kselftests/*
 
 elf:
     ignore:
@@ -35,14 +26,6 @@ emptyrpm:
         - kernel-debug
         - kernel-zfcpdump
         - kernel-zfcpdump-modules
-
-kmod:
-    ignore:
-        - /lib/modules/*/internal/*
-
-manpage:
-    ignore:
-        - /lib/modules/*
 
 patches:
     ignore_list:

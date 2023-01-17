@@ -613,7 +613,7 @@ static int cq_create(struct mlx5_vdpa_net *ndev, u16 idx, u32 num_ent)
 	cqc = MLX5_ADDR_OF(create_cq_in, in, cq_context);
 	MLX5_SET(cqc, cqc, log_cq_size, ilog2(num_ent));
 	MLX5_SET(cqc, cqc, uar_page, ndev->mvdev.res.uar->index);
-	MLX5_SET(cqc, cqc, c_eqn, eqn);
+	MLX5_SET(cqc, cqc, c_eqn_or_apu_element, eqn);
 	MLX5_SET64(cqc, cqc, dbr_addr, vcq->db.dma);
 
 	err = mlx5_core_create_cq(mdev, &vcq->mcq, in, inlen, out, sizeof(out));
@@ -860,7 +860,7 @@ static int create_virtqueue(struct mlx5_vdpa_net *ndev, struct mlx5_vdpa_virtque
 	MLX5_SET64(virtio_q, vq_ctx, desc_addr, mvq->desc_addr);
 	MLX5_SET64(virtio_q, vq_ctx, used_addr, mvq->device_addr);
 	MLX5_SET64(virtio_q, vq_ctx, available_addr, mvq->driver_addr);
-	MLX5_SET(virtio_q, vq_ctx, virtio_q_mkey, ndev->mvdev.mr.mkey.key);
+	MLX5_SET(virtio_q, vq_ctx, virtio_q_mkey, ndev->mvdev.mr.mkey);
 	MLX5_SET(virtio_q, vq_ctx, umem_1_id, mvq->umem1.id);
 	MLX5_SET(virtio_q, vq_ctx, umem_1_size, mvq->umem1.size);
 	MLX5_SET(virtio_q, vq_ctx, umem_2_id, mvq->umem2.id);
@@ -1450,7 +1450,7 @@ static virtio_net_ctrl_ack handle_ctrl_mac(struct mlx5_vdpa_dev *mvdev, u8 cmd)
 	virtio_net_ctrl_ack status = VIRTIO_NET_ERR;
 	struct mlx5_core_dev *pfmdev;
 	size_t read;
-	u8 mac[ETH_ALEN];
+	u8 mac[ETH_ALEN], mac_back[ETH_ALEN];
 
 	pfmdev = pci_get_drvdata(pci_physfn(mvdev->mdev->pdev));
 	switch (cmd) {
@@ -1463,6 +1463,9 @@ static virtio_net_ctrl_ack handle_ctrl_mac(struct mlx5_vdpa_dev *mvdev, u8 cmd)
 			status = VIRTIO_NET_OK;
 			break;
 		}
+
+		if (is_zero_ether_addr(mac))
+			break;
 
 		if (!is_zero_ether_addr(ndev->config.mac)) {
 			if (mlx5_mpfs_del_mac(pfmdev, ndev->config.mac)) {
@@ -1478,7 +1481,47 @@ static virtio_net_ctrl_ack handle_ctrl_mac(struct mlx5_vdpa_dev *mvdev, u8 cmd)
 			break;
 		}
 
+		/* backup the original mac address so that if failed to add the forward rules
+		 * we could restore it
+		 */
+		memcpy(mac_back, ndev->config.mac, ETH_ALEN);
+
 		memcpy(ndev->config.mac, mac, ETH_ALEN);
+
+		/* Need recreate the flow table entry, so that the packet could forward back
+		 */
+		remove_fwd_to_tir(ndev);
+
+		if (add_fwd_to_tir(ndev)) {
+			mlx5_vdpa_warn(mvdev, "failed to insert forward rules, try to restore\n");
+
+			/* Although it hardly run here, we still need double check */
+			if (is_zero_ether_addr(mac_back)) {
+				mlx5_vdpa_warn(mvdev, "restore mac failed: Original MAC is zero\n");
+				break;
+			}
+
+			/* Try to restore original mac address to MFPS table, and try to restore
+			 * the forward rule entry.
+			 */
+			if (mlx5_mpfs_del_mac(pfmdev, ndev->config.mac)) {
+				mlx5_vdpa_warn(mvdev, "restore mac failed: delete MAC %pM from MPFS table failed\n",
+					       ndev->config.mac);
+			}
+
+			if (mlx5_mpfs_add_mac(pfmdev, mac_back)) {
+				mlx5_vdpa_warn(mvdev, "restore mac failed: insert old MAC %pM into MPFS table failed\n",
+					       mac_back);
+			}
+
+			memcpy(ndev->config.mac, mac_back, ETH_ALEN);
+
+			if (add_fwd_to_tir(ndev))
+				mlx5_vdpa_warn(mvdev, "restore forward rules failed: insert forward rules failed\n");
+
+			break;
+		}
+
 		status = VIRTIO_NET_OK;
 		break;
 

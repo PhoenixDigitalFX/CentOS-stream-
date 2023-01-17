@@ -80,8 +80,24 @@
 
 #include <trace/events/sched.h>
 
+#define WARN_ONCE_SAFE(condition, format...)	({		\
+	static bool __section(.data.once) __warned;		\
+	int __ret_warn_once = !!(condition);			\
+								\
+	if (unlikely(__ret_warn_once && !__warned)) {		\
+		bool __warn_deferred = irqs_disabled();         \
+		__warned = true;				\
+		if(__warn_deferred)                         	\
+			printk_deferred_enter();		\
+		WARN(1, format);				\
+		if (__warn_deferred)				\
+			printk_deferred_exit();			\
+	}							\
+	unlikely(__ret_warn_once);				\
+})
+
 #ifdef CONFIG_SCHED_DEBUG
-# define SCHED_WARN_ON(x)	WARN_ONCE(x, #x)
+# define SCHED_WARN_ON(x)	WARN_ONCE_SAFE(x, #x)
 #else
 # define SCHED_WARN_ON(x)	({ (void)(x), 0; })
 #endif
@@ -349,9 +365,8 @@ extern void __setparam_dl(struct task_struct *p, const struct sched_attr *attr);
 extern void __getparam_dl(struct task_struct *p, struct sched_attr *attr);
 extern bool __checkparam_dl(const struct sched_attr *attr);
 extern bool dl_param_changed(struct task_struct *p, const struct sched_attr *attr);
-extern int  dl_task_can_attach(struct task_struct *p, const struct cpumask *cs_cpus_allowed);
 extern int  dl_cpuset_cpumask_can_shrink(const struct cpumask *cur, const struct cpumask *trial);
-extern bool dl_cpu_busy(unsigned int cpu);
+extern int  dl_cpu_busy(int cpu, struct task_struct *p);
 
 #ifdef CONFIG_CGROUP_SCHED
 
@@ -605,8 +620,8 @@ struct cfs_rq {
 	s64			runtime_remaining;
 
 	u64			throttled_clock;
-	u64			throttled_clock_task;
-	u64			throttled_clock_task_time;
+	u64	RH_KABI_RENAME(throttled_clock_task, throttled_clock_pelt);
+	u64	RH_KABI_RENAME(throttled_clock_task_time, throttled_clock_pelt_time);
 	int			throttled;
 	int			throttle_count;
 	struct list_head	throttled_list;
@@ -1428,6 +1443,11 @@ queue_balance_callback(struct rq *rq,
 {
 	lockdep_assert_held(&rq->lock);
 
+	/*
+	 * Don't (re)queue an already queued item; nor queue anything when
+	 * balance_push() is active, see the comment with
+	 * balance_push_callback.
+	 */
 	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
 		return;
 
@@ -1547,15 +1567,6 @@ static inline struct cpumask *sched_group_span(struct sched_group *sg)
 static inline struct cpumask *group_balance_mask(struct sched_group *sg)
 {
 	return to_cpumask(sg->sgc->cpumask);
-}
-
-/**
- * group_first_cpu - Returns the first CPU in the cpumask of a sched_group.
- * @group: The group whose first CPU is to be returned.
- */
-static inline unsigned int group_first_cpu(struct sched_group *group)
-{
-	return cpumask_first(sched_group_span(group));
 }
 
 extern int group_balance_cpu(struct sched_group *sg);
@@ -1766,7 +1777,6 @@ static inline int task_on_rq_migrating(struct task_struct *p)
 
 #define WF_SYNC     0x02 /* Waker goes to sleep after wakeup */
 #define WF_MIGRATED 0x20 /* Internal use, task got migrated */
-#define WF_ON_CPU   0x40 /* Wakee is on_cpu */
 
 #ifdef CONFIG_SMP
 static_assert(WF_EXEC == SD_BALANCE_EXEC);

@@ -74,6 +74,12 @@ static void irdma_set_qos_info(struct irdma_sc_vsi  *vsi,
 
 	vsi->qos_rel_bw = l2p->vsi_rel_bw;
 	vsi->qos_prio_type = l2p->vsi_prio_type;
+	vsi->dscp_mode = l2p->dscp_mode;
+	if (l2p->dscp_mode) {
+		memcpy(vsi->dscp_map, l2p->dscp_map, sizeof(vsi->dscp_map));
+		for (i = 0; i < IRDMA_MAX_USER_PRIORITY; i++)
+			l2p->up2tc[i] = i;
+	}
 	for (i = 0; i < IRDMA_MAX_USER_PRIORITY; i++) {
 		if (vsi->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_1)
 			vsi->qos[i].qs_handle = l2p->qs_handle_list[i];
@@ -4864,10 +4870,12 @@ int irdma_cfg_fpm_val(struct irdma_sc_dev *dev, u32 qp_count)
 
 		sd_diff = sd_needed - hmc_fpm_misc->max_sds;
 		if (sd_diff > 128) {
-			if (qpwanted > 128 && sd_diff > 144)
+			if (!(loop_count % 2) && qpwanted > 128) {
 				qpwanted /= 2;
-			mrwanted /= 2;
-			pblewanted /= 2;
+			} else {
+				mrwanted /= 2;
+				pblewanted /= 2;
+			}
 			continue;
 		}
 		if (dev->cqp->hmc_profile != IRDMA_HMC_PROFILE_FAVOR_VF &&

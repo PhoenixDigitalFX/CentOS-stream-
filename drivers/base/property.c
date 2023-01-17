@@ -478,8 +478,17 @@ int fwnode_property_get_reference_args(const struct fwnode_handle *fwnode,
 				       unsigned int nargs, unsigned int index,
 				       struct fwnode_reference_args *args)
 {
-	return fwnode_call_int_op(fwnode, get_reference_args, prop, nargs_prop,
-				  nargs, index, args);
+	int ret;
+
+	ret = fwnode_call_int_op(fwnode, get_reference_args, prop, nargs_prop,
+				 nargs, index, args);
+
+	if (ret < 0 && !IS_ERR_OR_NULL(fwnode) &&
+	    !IS_ERR_OR_NULL(fwnode->secondary))
+		ret = fwnode_call_int_op(fwnode->secondary, get_reference_args,
+					 prop, nargs_prop, nargs, index, args);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(fwnode_property_get_reference_args);
 
@@ -862,33 +871,16 @@ EXPORT_SYMBOL_GPL(device_get_child_node_count);
 
 bool device_dma_supported(struct device *dev)
 {
-	const struct fwnode_handle *fwnode = dev_fwnode(dev);
-
-	/* For DT, this is always supported.
-	 * For ACPI, this depends on CCA, which
-	 * is determined by the acpi_dma_supported().
-	 */
-	if (is_of_node(fwnode))
-		return true;
-
-	return acpi_dma_supported(to_acpi_device_node(fwnode));
+	return fwnode_call_bool_op(dev_fwnode(dev), device_dma_supported);
 }
 EXPORT_SYMBOL_GPL(device_dma_supported);
 
 enum dev_dma_attr device_get_dma_attr(struct device *dev)
 {
-	const struct fwnode_handle *fwnode = dev_fwnode(dev);
-	enum dev_dma_attr attr = DEV_DMA_NOT_SUPPORTED;
+	if (!fwnode_has_op(dev_fwnode(dev), device_get_dma_attr))
+		return DEV_DMA_NOT_SUPPORTED;
 
-	if (is_of_node(fwnode)) {
-		if (of_dma_is_coherent(to_of_node(fwnode)))
-			attr = DEV_DMA_COHERENT;
-		else
-			attr = DEV_DMA_NON_COHERENT;
-	} else
-		attr = acpi_get_dma_attr(to_acpi_device_node(fwnode));
-
-	return attr;
+	return fwnode_call_int_op(dev_fwnode(dev), device_get_dma_attr);
 }
 EXPORT_SYMBOL_GPL(device_get_dma_attr);
 
@@ -935,6 +927,19 @@ int device_get_phy_mode(struct device *dev)
 EXPORT_SYMBOL_GPL(device_get_phy_mode);
 
 /**
+ * fwnode_iomap - Maps the memory mapped IO for a given fwnode
+ * @fwnode:	Pointer to the firmware node
+ * @index:	Index of the IO range
+ *
+ * Returns a pointer to the mapped memory.
+ */
+void __iomem *fwnode_iomap(struct fwnode_handle *fwnode, int index)
+{
+	return fwnode_call_ptr_op(fwnode, iomap, index);
+}
+EXPORT_SYMBOL(fwnode_iomap);
+
+/**
  * fwnode_irq_get - Get IRQ directly from a fwnode
  * @fwnode:	Pointer to the firmware node
  * @index:	Zero-based index of the IRQ
@@ -944,19 +949,38 @@ EXPORT_SYMBOL_GPL(device_get_phy_mode);
  */
 int fwnode_irq_get(const struct fwnode_handle *fwnode, unsigned int index)
 {
-	struct resource res;
-	int ret;
-
-	if (is_of_node(fwnode))
-		return of_irq_get(to_of_node(fwnode), index);
-
-	ret = acpi_irq_get(ACPI_HANDLE_FWNODE(fwnode), index, &res);
-	if (ret)
-		return ret;
-
-	return res.start;
+	return fwnode_call_int_op(fwnode, irq_get, index);
 }
 EXPORT_SYMBOL(fwnode_irq_get);
+
+/**
+ * fwnode_irq_get_byname - Get IRQ from a fwnode using its name
+ * @fwnode:	Pointer to the firmware node
+ * @name:	IRQ name
+ *
+ * Description:
+ * Find a match to the string @name in the 'interrupt-names' string array
+ * in _DSD for ACPI, or of_node for Device Tree. Then get the Linux IRQ
+ * number of the IRQ resource corresponding to the index of the matched
+ * string.
+ *
+ * Return:
+ * Linux IRQ number on success, or negative errno otherwise.
+ */
+int fwnode_irq_get_byname(const struct fwnode_handle *fwnode, const char *name)
+{
+	int index;
+
+	if (!name)
+		return -EINVAL;
+
+	index = fwnode_property_match_string(fwnode, "interrupt-names",  name);
+	if (index < 0)
+		return index;
+
+	return fwnode_irq_get(fwnode, index);
+}
+EXPORT_SYMBOL(fwnode_irq_get_byname);
 
 /**
  * fwnode_graph_get_next_endpoint - Get next endpoint firmware node
@@ -1053,9 +1077,9 @@ struct fwnode_handle *
 fwnode_graph_get_remote_node(const struct fwnode_handle *fwnode, u32 port_id,
 			     u32 endpoint_id)
 {
-	struct fwnode_handle *endpoint = NULL;
+	struct fwnode_handle *endpoint;
 
-	while ((endpoint = fwnode_graph_get_next_endpoint(fwnode, endpoint))) {
+	fwnode_graph_for_each_endpoint(fwnode, endpoint) {
 		struct fwnode_endpoint fwnode_ep;
 		struct fwnode_handle *remote;
 		int ret;
@@ -1078,6 +1102,18 @@ fwnode_graph_get_remote_node(const struct fwnode_handle *fwnode, u32 port_id,
 }
 EXPORT_SYMBOL_GPL(fwnode_graph_get_remote_node);
 
+static bool fwnode_graph_remote_available(struct fwnode_handle *ep)
+{
+	struct fwnode_handle *dev_node;
+	bool available;
+
+	dev_node = fwnode_graph_get_remote_port_parent(ep);
+	available = fwnode_device_is_available(dev_node);
+	fwnode_handle_put(dev_node);
+
+	return available;
+}
+
 /**
  * fwnode_graph_get_endpoint_by_id - get endpoint by port and endpoint numbers
  * @fwnode: parent fwnode_handle containing the graph
@@ -1092,8 +1128,8 @@ EXPORT_SYMBOL_GPL(fwnode_graph_get_remote_node);
  * has not been found, look for the closest endpoint ID greater than the
  * specified one and return the endpoint that corresponds to it, if present.
  *
- * Do not return endpoints that belong to disabled devices, unless
- * FWNODE_GRAPH_DEVICE_DISABLED is passed in @flags.
+ * Does not return endpoints that belong to disabled devices or endpoints that
+ * are unconnected, unless FWNODE_GRAPH_DEVICE_DISABLED is passed in @flags.
  *
  * The returned endpoint needs to be released by calling fwnode_handle_put() on
  * it when it is not needed any more.
@@ -1102,25 +1138,17 @@ struct fwnode_handle *
 fwnode_graph_get_endpoint_by_id(const struct fwnode_handle *fwnode,
 				u32 port, u32 endpoint, unsigned long flags)
 {
-	struct fwnode_handle *ep = NULL, *best_ep = NULL;
+	struct fwnode_handle *ep, *best_ep = NULL;
 	unsigned int best_ep_id = 0;
 	bool endpoint_next = flags & FWNODE_GRAPH_ENDPOINT_NEXT;
 	bool enabled_only = !(flags & FWNODE_GRAPH_DEVICE_DISABLED);
 
-	while ((ep = fwnode_graph_get_next_endpoint(fwnode, ep))) {
+	fwnode_graph_for_each_endpoint(fwnode, ep) {
 		struct fwnode_endpoint fwnode_ep = { 0 };
 		int ret;
 
-		if (enabled_only) {
-			struct fwnode_handle *dev_node;
-			bool available;
-
-			dev_node = fwnode_graph_get_remote_port_parent(ep);
-			available = fwnode_device_is_available(dev_node);
-			fwnode_handle_put(dev_node);
-			if (!available)
-				continue;
-		}
+		if (enabled_only && !fwnode_graph_remote_available(ep))
+			continue;
 
 		ret = fwnode_graph_parse_endpoint(ep, &fwnode_ep);
 		if (ret < 0)
@@ -1149,16 +1177,34 @@ fwnode_graph_get_endpoint_by_id(const struct fwnode_handle *fwnode,
 		best_ep_id = fwnode_ep.id;
 	}
 
-	if (best_ep)
-		return best_ep;
-
-	if (fwnode && !IS_ERR_OR_NULL(fwnode->secondary))
-		return fwnode_graph_get_endpoint_by_id(fwnode->secondary, port,
-						       endpoint, flags);
-
-	return NULL;
+	return best_ep;
 }
 EXPORT_SYMBOL_GPL(fwnode_graph_get_endpoint_by_id);
+
+/**
+ * fwnode_graph_get_endpoint_count - Count endpoints on a device node
+ * @fwnode: The node related to a device
+ * @flags: fwnode lookup flags
+ * Count endpoints in a device node.
+ *
+ * If FWNODE_GRAPH_DEVICE_DISABLED flag is specified, also unconnected endpoints
+ * and endpoints connected to disabled devices are counted.
+ */
+unsigned int fwnode_graph_get_endpoint_count(struct fwnode_handle *fwnode,
+					     unsigned long flags)
+{
+	struct fwnode_handle *ep;
+	unsigned int count = 0;
+
+	fwnode_graph_for_each_endpoint(fwnode, ep) {
+		if (flags & FWNODE_GRAPH_DEVICE_DISABLED ||
+		    fwnode_graph_remote_available(ep))
+			count++;
+	}
+
+	return count;
+}
+EXPORT_SYMBOL_GPL(fwnode_graph_get_endpoint_count);
 
 /**
  * fwnode_graph_parse_endpoint - parse common endpoint node properties

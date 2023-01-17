@@ -263,7 +263,7 @@ bool mlx5e_tls_handle_tx_skb(struct net_device *netdev, struct mlx5e_txqsq *sq,
 	int datalen;
 	u32 skb_seq;
 
-	datalen = skb->len - (skb_transport_offset(skb) + tcp_hdrlen(skb));
+	datalen = skb->len - skb_tcp_all_headers(skb);
 	if (!datalen)
 		return true;
 
@@ -386,5 +386,5 @@ u16 mlx5e_tls_get_stop_room(struct mlx5_core_dev *mdev, struct mlx5e_params *par
 
 	/* FPGA */
 	/* Resync SKB. */
-	return mlx5e_stop_room_for_wqe(MLX5_SEND_WQE_MAX_WQEBBS);
+	return mlx5e_stop_room_for_max_wqe(mdev);
 }

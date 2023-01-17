@@ -1197,9 +1197,9 @@ struct devlink_ops {
 			 struct netlink_ext_ack *extack);
 	int (*port_type_set)(struct devlink_port *devlink_port,
 			     enum devlink_port_type port_type);
-	int (*port_split)(struct devlink *devlink, unsigned int port_index,
+	int (*port_split)(struct devlink *devlink, struct devlink_port *port,
 			  unsigned int count, struct netlink_ext_ack *extack);
-	int (*port_unsplit)(struct devlink *devlink, unsigned int port_index,
+	int (*port_unsplit)(struct devlink *devlink, struct devlink_port *port,
 			    struct netlink_ext_ack *extack);
 	int (*sb_pool_get)(struct devlink *devlink, unsigned int sb_index,
 			   u16 pool_index,
@@ -1479,6 +1479,21 @@ void *devlink_priv(struct devlink *devlink);
 struct devlink *priv_to_devlink(void *priv);
 struct device *devlink_to_dev(const struct devlink *devlink);
 
+/* Devlink instance explicit locking */
+void devl_lock(struct devlink *devlink);
+void devl_unlock(struct devlink *devlink);
+void devl_assert_locked(struct devlink *devlink);
+bool devl_lock_is_held(struct devlink *devlink);
+
+int devl_port_register(struct devlink *devlink,
+		       struct devlink_port *devlink_port,
+		       unsigned int port_index);
+void devl_port_unregister(struct devlink_port *devlink_port);
+
+int devl_rate_leaf_create(struct devlink_port *port, void *priv);
+void devl_rate_leaf_destroy(struct devlink_port *devlink_port);
+void devl_rate_nodes_destroy(struct devlink *devlink);
+
 struct ib_device;
 
 struct net *devlink_net(const struct devlink *devlink);
@@ -1717,9 +1732,9 @@ devlink_trap_policers_unregister(struct devlink *devlink,
 struct devlink *__must_check devlink_try_get(struct devlink *devlink);
 void devlink_put(struct devlink *devlink);
 
-void devlink_compat_running_version(struct net_device *dev,
+void devlink_compat_running_version(struct devlink *devlink,
 				    char *buf, size_t len);
-int devlink_compat_flash_update(struct net_device *dev, const char *file_name);
+int devlink_compat_flash_update(struct devlink *devlink, const char *file_name);
 int devlink_compat_phys_port_name_get(struct net_device *dev,
 				      char *name, size_t len);
 int devlink_compat_switch_id_get(struct net_device *dev,
@@ -1737,12 +1752,12 @@ static inline void devlink_put(struct devlink *devlink)
 }
 
 static inline void
-devlink_compat_running_version(struct net_device *dev, char *buf, size_t len)
+devlink_compat_running_version(struct devlink *devlink, char *buf, size_t len)
 {
 }
 
 static inline int
-devlink_compat_flash_update(struct net_device *dev, const char *file_name)
+devlink_compat_flash_update(struct devlink *devlink, const char *file_name)
 {
 	return -EOPNOTSUPP;
 }

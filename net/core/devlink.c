@@ -228,6 +228,33 @@ struct devlink *__must_check devlink_try_get(struct devlink *devlink)
 	return NULL;
 }
 
+void devl_assert_locked(struct devlink *devlink)
+{
+	lockdep_assert_held(&devlink->lock);
+}
+EXPORT_SYMBOL_GPL(devl_assert_locked);
+
+#ifdef CONFIG_LOCKDEP
+/* For use in conjunction with LOCKDEP only e.g. rcu_dereference_protected() */
+bool devl_lock_is_held(struct devlink *devlink)
+{
+	return lockdep_is_held(&devlink->lock);
+}
+EXPORT_SYMBOL_GPL(devl_lock_is_held);
+#endif
+
+void devl_lock(struct devlink *devlink)
+{
+	mutex_lock(&devlink->lock);
+}
+EXPORT_SYMBOL_GPL(devl_lock);
+
+void devl_unlock(struct devlink *devlink)
+{
+	mutex_unlock(&devlink->lock);
+}
+EXPORT_SYMBOL_GPL(devl_unlock);
+
 static struct devlink *devlink_get_from_attrs(struct net *net,
 					      struct nlattr **attrs)
 {
@@ -1544,34 +1571,19 @@ static int devlink_nl_cmd_port_set_doit(struct sk_buff *skb,
 	return 0;
 }
 
-static int devlink_port_split(struct devlink *devlink, u32 port_index,
-			      u32 count, struct netlink_ext_ack *extack)
-
-{
-	if (devlink->ops->port_split)
-		return devlink->ops->port_split(devlink, port_index, count,
-						extack);
-	return -EOPNOTSUPP;
-}
-
 static int devlink_nl_cmd_port_split_doit(struct sk_buff *skb,
 					  struct genl_info *info)
 {
+	struct devlink_port *devlink_port = info->user_ptr[1];
 	struct devlink *devlink = info->user_ptr[0];
-	struct devlink_port *devlink_port;
-	u32 port_index;
 	u32 count;
 
-	if (!info->attrs[DEVLINK_ATTR_PORT_INDEX] ||
-	    !info->attrs[DEVLINK_ATTR_PORT_SPLIT_COUNT])
+	if (!info->attrs[DEVLINK_ATTR_PORT_SPLIT_COUNT])
 		return -EINVAL;
+	if (!devlink->ops->port_split)
+		return -EOPNOTSUPP;
 
-	devlink_port = devlink_port_get_from_info(devlink, info);
-	port_index = nla_get_u32(info->attrs[DEVLINK_ATTR_PORT_INDEX]);
 	count = nla_get_u32(info->attrs[DEVLINK_ATTR_PORT_SPLIT_COUNT]);
-
-	if (IS_ERR(devlink_port))
-		return -EINVAL;
 
 	if (!devlink_port->attrs.splittable) {
 		/* Split ports cannot be split. */
@@ -1587,29 +1599,19 @@ static int devlink_nl_cmd_port_split_doit(struct sk_buff *skb,
 		return -EINVAL;
 	}
 
-	return devlink_port_split(devlink, port_index, count, info->extack);
-}
-
-static int devlink_port_unsplit(struct devlink *devlink, u32 port_index,
-				struct netlink_ext_ack *extack)
-
-{
-	if (devlink->ops->port_unsplit)
-		return devlink->ops->port_unsplit(devlink, port_index, extack);
-	return -EOPNOTSUPP;
+	return devlink->ops->port_split(devlink, devlink_port, count,
+					info->extack);
 }
 
 static int devlink_nl_cmd_port_unsplit_doit(struct sk_buff *skb,
 					    struct genl_info *info)
 {
+	struct devlink_port *devlink_port = info->user_ptr[1];
 	struct devlink *devlink = info->user_ptr[0];
-	u32 port_index;
 
-	if (!info->attrs[DEVLINK_ATTR_PORT_INDEX])
-		return -EINVAL;
-
-	port_index = nla_get_u32(info->attrs[DEVLINK_ATTR_PORT_INDEX]);
-	return devlink_port_unsplit(devlink, port_index, info->extack);
+	if (!devlink->ops->port_unsplit)
+		return -EOPNOTSUPP;
+	return devlink->ops->port_unsplit(devlink, devlink_port, info->extack);
 }
 
 static int devlink_port_new_notifiy(struct devlink *devlink,
@@ -2869,15 +2871,11 @@ static int devlink_rate_nodes_check(struct devlink *devlink, u16 mode,
 {
 	struct devlink_rate *devlink_rate;
 
-	/* Take the lock to sync with devlink_rate_nodes_destroy() */
-	mutex_lock(&devlink->lock);
 	list_for_each_entry(devlink_rate, &devlink->rate_list, list)
 		if (devlink_rate_is_node(devlink_rate)) {
-			mutex_unlock(&devlink->lock);
 			NL_SET_ERR_MSG_MOD(extack, "Rate node(s) exists.");
 			return -EBUSY;
 		}
-	mutex_unlock(&devlink->lock);
 	return 0;
 }
 
@@ -8653,14 +8651,14 @@ static const struct genl_small_ops devlink_nl_ops[] = {
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = devlink_nl_cmd_port_split_doit,
 		.flags = GENL_ADMIN_PERM,
-		.internal_flags = DEVLINK_NL_FLAG_NO_LOCK,
+		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT,
 	},
 	{
 		.cmd = DEVLINK_CMD_PORT_UNSPLIT,
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = devlink_nl_cmd_port_unsplit_doit,
 		.flags = GENL_ADMIN_PERM,
-		.internal_flags = DEVLINK_NL_FLAG_NO_LOCK,
+		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT,
 	},
 	{
 		.cmd = DEVLINK_CMD_PORT_NEW,
@@ -8741,14 +8739,12 @@ static const struct genl_small_ops devlink_nl_ops[] = {
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = devlink_nl_cmd_eswitch_get_doit,
 		.flags = GENL_ADMIN_PERM,
-		.internal_flags = DEVLINK_NL_FLAG_NO_LOCK,
 	},
 	{
 		.cmd = DEVLINK_CMD_ESWITCH_SET,
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = devlink_nl_cmd_eswitch_set_doit,
 		.flags = GENL_ADMIN_PERM,
-		.internal_flags = DEVLINK_NL_FLAG_NO_LOCK,
 	},
 	{
 		.cmd = DEVLINK_CMD_DPIPE_TABLE_GET,
@@ -9257,6 +9253,32 @@ static void devlink_port_type_warn_cancel(struct devlink_port *devlink_port)
 	cancel_delayed_work_sync(&devlink_port->type_warn_dw);
 }
 
+int devl_port_register(struct devlink *devlink,
+		       struct devlink_port *devlink_port,
+		       unsigned int port_index)
+{
+	lockdep_assert_held(&devlink->lock);
+
+	if (devlink_port_index_exists(devlink, port_index))
+		return -EEXIST;
+
+	WARN_ON(devlink_port->devlink);
+	devlink_port->devlink = devlink;
+	devlink_port->index = port_index;
+	spin_lock_init(&devlink_port->type_lock);
+	INIT_LIST_HEAD(&devlink_port->reporter_list);
+	mutex_init(&devlink_port->reporters_lock);
+	list_add_tail(&devlink_port->list, &devlink->port_list);
+	INIT_LIST_HEAD(&devlink_port->param_list);
+	INIT_LIST_HEAD(&devlink_port->region_list);
+
+	INIT_DELAYED_WORK(&devlink_port->type_warn_dw, &devlink_port_type_warn);
+	devlink_port_type_warn_schedule(devlink_port);
+	devlink_port_notify(devlink_port, DEVLINK_CMD_PORT_NEW);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(devl_port_register);
+
 /**
  *	devlink_port_register - Register devlink port
  *
@@ -9274,28 +9296,27 @@ int devlink_port_register(struct devlink *devlink,
 			  struct devlink_port *devlink_port,
 			  unsigned int port_index)
 {
-	mutex_lock(&devlink->lock);
-	if (devlink_port_index_exists(devlink, port_index)) {
-		mutex_unlock(&devlink->lock);
-		return -EEXIST;
-	}
+	int err;
 
-	WARN_ON(devlink_port->devlink);
-	devlink_port->devlink = devlink;
-	devlink_port->index = port_index;
-	spin_lock_init(&devlink_port->type_lock);
-	INIT_LIST_HEAD(&devlink_port->reporter_list);
-	mutex_init(&devlink_port->reporters_lock);
-	list_add_tail(&devlink_port->list, &devlink->port_list);
-	INIT_LIST_HEAD(&devlink_port->param_list);
-	INIT_LIST_HEAD(&devlink_port->region_list);
+	mutex_lock(&devlink->lock);
+	err = devl_port_register(devlink, devlink_port, port_index);
 	mutex_unlock(&devlink->lock);
-	INIT_DELAYED_WORK(&devlink_port->type_warn_dw, &devlink_port_type_warn);
-	devlink_port_type_warn_schedule(devlink_port);
-	devlink_port_notify(devlink_port, DEVLINK_CMD_PORT_NEW);
-	return 0;
+	return err;
 }
 EXPORT_SYMBOL_GPL(devlink_port_register);
+
+void devl_port_unregister(struct devlink_port *devlink_port)
+{
+	lockdep_assert_held(&devlink_port->devlink->lock);
+
+	devlink_port_type_warn_cancel(devlink_port);
+	devlink_port_notify(devlink_port, DEVLINK_CMD_PORT_DEL);
+	list_del(&devlink_port->list);
+	WARN_ON(!list_empty(&devlink_port->reporter_list));
+	WARN_ON(!list_empty(&devlink_port->region_list));
+	mutex_destroy(&devlink_port->reporters_lock);
+}
+EXPORT_SYMBOL_GPL(devl_port_unregister);
 
 /**
  *	devlink_port_unregister - Unregister devlink port
@@ -9306,14 +9327,9 @@ void devlink_port_unregister(struct devlink_port *devlink_port)
 {
 	struct devlink *devlink = devlink_port->devlink;
 
-	devlink_port_type_warn_cancel(devlink_port);
-	devlink_port_notify(devlink_port, DEVLINK_CMD_PORT_DEL);
 	mutex_lock(&devlink->lock);
-	list_del(&devlink_port->list);
+	devl_port_unregister(devlink_port);
 	mutex_unlock(&devlink->lock);
-	WARN_ON(!list_empty(&devlink_port->reporter_list));
-	WARN_ON(!list_empty(&devlink_port->region_list));
-	mutex_destroy(&devlink_port->reporters_lock);
 }
 EXPORT_SYMBOL_GPL(devlink_port_unregister);
 
@@ -9534,30 +9550,26 @@ void devlink_port_attrs_pci_sf_set(struct devlink_port *devlink_port, u32 contro
 EXPORT_SYMBOL_GPL(devlink_port_attrs_pci_sf_set);
 
 /**
- * devlink_rate_leaf_create - create devlink rate leaf
- *
+ * devl_rate_leaf_create - create devlink rate leaf
  * @devlink_port: devlink port object to create rate object on
  * @priv: driver private data
  *
  * Create devlink rate object of type leaf on provided @devlink_port.
- * Throws call trace if @devlink_port already has a devlink rate object.
- *
- * Context: Takes and release devlink->lock <mutex>.
- *
- * Return: -ENOMEM if failed to allocate rate object, 0 otherwise.
  */
-int
-devlink_rate_leaf_create(struct devlink_port *devlink_port, void *priv)
+int devl_rate_leaf_create(struct devlink_port *devlink_port, void *priv)
 {
 	struct devlink *devlink = devlink_port->devlink;
 	struct devlink_rate *devlink_rate;
+
+	devl_assert_locked(devlink_port->devlink);
+
+	if (WARN_ON(devlink_port->devlink_rate))
+		return -EBUSY;
 
 	devlink_rate = kzalloc(sizeof(*devlink_rate), GFP_KERNEL);
 	if (!devlink_rate)
 		return -ENOMEM;
 
-	mutex_lock(&devlink->lock);
-	WARN_ON(devlink_port->devlink_rate);
 	devlink_rate->type = DEVLINK_RATE_TYPE_LEAF;
 	devlink_rate->devlink = devlink;
 	devlink_rate->devlink_port = devlink_port;
@@ -9565,11 +9577,41 @@ devlink_rate_leaf_create(struct devlink_port *devlink_port, void *priv)
 	list_add_tail(&devlink_rate->list, &devlink->rate_list);
 	devlink_port->devlink_rate = devlink_rate;
 	devlink_rate_notify(devlink_rate, DEVLINK_CMD_RATE_NEW);
-	mutex_unlock(&devlink->lock);
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(devl_rate_leaf_create);
+
+int
+devlink_rate_leaf_create(struct devlink_port *devlink_port, void *priv)
+{
+	struct devlink *devlink = devlink_port->devlink;
+	int ret;
+
+	mutex_lock(&devlink->lock);
+	ret = devl_rate_leaf_create(devlink_port, priv);
+	mutex_unlock(&devlink->lock);
+
+	return ret;
+}
 EXPORT_SYMBOL_GPL(devlink_rate_leaf_create);
+
+void devl_rate_leaf_destroy(struct devlink_port *devlink_port)
+{
+	struct devlink_rate *devlink_rate = devlink_port->devlink_rate;
+
+	devl_assert_locked(devlink_port->devlink);
+	if (!devlink_rate)
+		return;
+
+	devlink_rate_notify(devlink_rate, DEVLINK_CMD_RATE_DEL);
+	if (devlink_rate->parent)
+		refcount_dec(&devlink_rate->parent->refcnt);
+	list_del(&devlink_rate->list);
+	devlink_port->devlink_rate = NULL;
+	kfree(devlink_rate);
+}
+EXPORT_SYMBOL_GPL(devl_rate_leaf_destroy);
 
 /**
  * devlink_rate_leaf_destroy - destroy devlink rate leaf
@@ -9587,32 +9629,25 @@ void devlink_rate_leaf_destroy(struct devlink_port *devlink_port)
 		return;
 
 	mutex_lock(&devlink->lock);
-	devlink_rate_notify(devlink_rate, DEVLINK_CMD_RATE_DEL);
-	if (devlink_rate->parent)
-		refcount_dec(&devlink_rate->parent->refcnt);
-	list_del(&devlink_rate->list);
-	devlink_port->devlink_rate = NULL;
+	devl_rate_leaf_destroy(devlink_port);
 	mutex_unlock(&devlink->lock);
-	kfree(devlink_rate);
 }
 EXPORT_SYMBOL_GPL(devlink_rate_leaf_destroy);
 
 /**
- * devlink_rate_nodes_destroy - destroy all devlink rate nodes on device
- *
+ * devl_rate_nodes_destroy - destroy all devlink rate nodes on device
  * @devlink: devlink instance
  *
  * Unset parent for all rate objects and destroy all rate nodes
  * on specified device.
- *
- * Context: Takes and release devlink->lock <mutex>.
  */
-void devlink_rate_nodes_destroy(struct devlink *devlink)
+void devl_rate_nodes_destroy(struct devlink *devlink)
 {
 	static struct devlink_rate *devlink_rate, *tmp;
 	const struct devlink_ops *ops = devlink->ops;
 
-	mutex_lock(&devlink->lock);
+	devl_assert_locked(devlink);
+
 	list_for_each_entry(devlink_rate, &devlink->rate_list, list) {
 		if (!devlink_rate->parent)
 			continue;
@@ -9633,6 +9668,23 @@ void devlink_rate_nodes_destroy(struct devlink *devlink)
 			kfree(devlink_rate);
 		}
 	}
+}
+EXPORT_SYMBOL_GPL(devl_rate_nodes_destroy);
+
+/**
+ * devlink_rate_nodes_destroy - destroy all devlink rate nodes on device
+ *
+ * @devlink: devlink instance
+ *
+ * Unset parent for all rate objects and destroy all rate nodes
+ * on specified device.
+ *
+ * Context: Takes and release devlink->lock <mutex>.
+ */
+void devlink_rate_nodes_destroy(struct devlink *devlink)
+{
+	mutex_lock(&devlink->lock);
+	devl_rate_nodes_destroy(devlink);
 	mutex_unlock(&devlink->lock);
 }
 EXPORT_SYMBOL_GPL(devlink_rate_nodes_destroy);
@@ -11340,55 +11392,28 @@ static struct devlink_port *netdev_to_devlink_port(struct net_device *dev)
 	return dev->netdev_ops->ndo_get_devlink_port(dev);
 }
 
-static struct devlink *netdev_to_devlink(struct net_device *dev)
-{
-	struct devlink_port *devlink_port = netdev_to_devlink_port(dev);
-
-	if (!devlink_port)
-		return NULL;
-
-	return devlink_port->devlink;
-}
-
-void devlink_compat_running_version(struct net_device *dev,
+void devlink_compat_running_version(struct devlink *devlink,
 				    char *buf, size_t len)
 {
-	struct devlink *devlink;
-
-	dev_hold(dev);
-	rtnl_unlock();
-
-	devlink = netdev_to_devlink(dev);
-	if (!devlink || !devlink->ops->info_get)
-		goto out;
+	if (!devlink->ops->info_get)
+		return;
 
 	mutex_lock(&devlink->lock);
 	__devlink_compat_running_version(devlink, buf, len);
 	mutex_unlock(&devlink->lock);
-
-out:
-	rtnl_lock();
-	dev_put(dev);
 }
 
-int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
+int devlink_compat_flash_update(struct devlink *devlink, const char *file_name)
 {
 	struct devlink_flash_update_params params = {};
-	struct devlink *devlink;
 	int ret;
 
-	dev_hold(dev);
-	rtnl_unlock();
-
-	devlink = netdev_to_devlink(dev);
-	if (!devlink || !devlink->ops->flash_update) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
+	if (!devlink->ops->flash_update)
+		return -EOPNOTSUPP;
 
 	ret = request_firmware(&params.fw, file_name, devlink->dev);
 	if (ret)
-		goto out;
+		return ret;
 
 	mutex_lock(&devlink->lock);
 	devlink_flash_update_begin_notify(devlink);
@@ -11397,10 +11422,6 @@ int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
 	mutex_unlock(&devlink->lock);
 
 	release_firmware(params.fw);
-
-out:
-	rtnl_lock();
-	dev_put(dev);
 
 	return ret;
 }

@@ -414,7 +414,7 @@ static void mt6359_accdet_work(struct work_struct *work)
 
 static void mt6359_accdet_jd_work(struct work_struct *work)
 {
-	int ret = 0;
+	int ret;
 	unsigned int value = 0;
 
 	struct mt6359_accdet *priv =
@@ -675,6 +675,7 @@ static int mt6359_accdet_parse_dt(struct mt6359_accdet *priv)
 			       sizeof(struct three_key_threshold));
 	}
 
+	of_node_put(node);
 	dev_warn(priv->dev, "accdet caps=%x\n", priv->caps);
 
 	return 0;

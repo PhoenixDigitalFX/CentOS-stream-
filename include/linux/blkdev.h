@@ -624,6 +624,7 @@ struct request_queue {
 
 	RH_KABI_EXTEND(struct sbitmap_queue	sched_bitmap_tags)
 	RH_KABI_EXTEND(struct sbitmap_queue	sched_breserved_tags)
+	RH_KABI_EXTEND(int			quiesce_depth)
 };
 
 /* Keep blk_queue_flag_name[] in sync with the definitions below */
@@ -663,9 +664,9 @@ struct request_queue {
 				 (1 << QUEUE_FLAG_SAME_COMP)	|	\
 				 (1 << QUEUE_FLAG_ADD_RANDOM))
 
-#define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
-				 (1 << QUEUE_FLAG_SAME_COMP) |		\
-				 (1 << QUEUE_FLAG_NOWAIT))
+#define QUEUE_FLAG_MQ_DEFAULT	((1UL << QUEUE_FLAG_IO_STAT) |		\
+				 (1UL << QUEUE_FLAG_SAME_COMP) |	\
+				 (1UL << QUEUE_FLAG_NOWAIT))
 
 void blk_queue_flag_set(unsigned int flag, struct request_queue *q);
 void blk_queue_flag_clear(unsigned int flag, struct request_queue *q);
@@ -724,6 +725,8 @@ extern void blk_clear_pm_only(struct request_queue *q);
 #define dma_map_bvec(dev, bv, dir, attrs) \
 	dma_map_page_attrs(dev, (bv)->bv_page, (bv)->bv_offset, (bv)->bv_len, \
 	(dir), (attrs))
+
+#define queue_to_disk(q)	(dev_to_disk(kobj_to_dev((q)->kobj.parent)))
 
 static inline bool queue_is_mq(struct request_queue *q)
 {

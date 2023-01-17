@@ -27,10 +27,15 @@ struct device;
  * LINKS_ADDED:	The fwnode has already be parsed to add fwnode links.
  * NOT_DEVICE:	The fwnode will never be populated as a struct device.
  * INITIALIZED: The hardware corresponding to fwnode has been initialized.
+ * NEEDS_CHILD_BOUND_ON_ADD: For this fwnode/device to probe successfully, its
+ *			     driver needs its child devices to be bound with
+ *			     their respective drivers as soon as they are
+ *			     added.
  */
-#define FWNODE_FLAG_LINKS_ADDED		BIT(0)
-#define FWNODE_FLAG_NOT_DEVICE		BIT(1)
-#define FWNODE_FLAG_INITIALIZED		BIT(2)
+#define FWNODE_FLAG_LINKS_ADDED			BIT(0)
+#define FWNODE_FLAG_NOT_DEVICE			BIT(1)
+#define FWNODE_FLAG_INITIALIZED			BIT(2)
+#define FWNODE_FLAG_NEEDS_CHILD_BOUND_ON_ADD	BIT(3)
 
 struct fwnode_handle {
 	struct fwnode_handle *secondary;
@@ -139,6 +144,11 @@ struct fwnode_operations {
 			 struct device *dev))
 	RH_KABI_EXTEND(const char *(*get_name)(const struct fwnode_handle *fwnode))
 	RH_KABI_EXTEND(const char *(*get_name_prefix)(const struct fwnode_handle *fwnode))
+	RH_KABI_EXTEND(bool (*device_dma_supported)(const struct fwnode_handle *fwnode))
+	RH_KABI_EXTEND(enum dev_dma_attr
+	               (*device_get_dma_attr)(const struct fwnode_handle *fwnode))
+	RH_KABI_EXTEND(void __iomem *(*iomap)(struct fwnode_handle *fwnode, int index))
+	RH_KABI_EXTEND( int (*irq_get)(const struct fwnode_handle *fwnode, unsigned int index))
 };
 
 #define fwnode_has_op(fwnode, op)				\
